@@ -494,3 +494,253 @@ func Test_Acceptance09_UnauthorizedCannotModifyPermissions(t *testing.T) {
 		t.Errorf("an unauthorized grant was recorded: %v", list.Permissions)
 	}
 }
+
+// Test_Acceptance04_QueuedOrNotified covers acceptance criterion 4: messages
+// can be queued or delivered as notifications.
+func Test_Acceptance04_QueuedOrNotified(t *testing.T) {
+	env := startAcceptanceHost(t)
+
+	env.registerSession("ses_hermes0000000000000000000000", "hermes-agent", "hermes")
+
+	client := dialRPC(t, env.socketPath)
+
+	// A queued message is persisted and available for the next turn.
+	queuedResp := client.call(t, protocol.MethodMessageSend, map[string]any{
+		"commandId": "cmd_acceptance000000000000000005",
+		"to":        map[string]any{"sessionId": "ses_hermes0000000000000000000000"},
+		"body":      map[string]any{"type": "text", "text": "queued"},
+		"delivery":  map[string]any{"mode": "queue", "wake": "none", "onUnsupported": "reject"},
+	})
+	if queuedResp.Error != nil {
+		t.Fatalf("queue send failed: %v", queuedResp.Error)
+	}
+	var queued struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := json.Unmarshal(queuedResp.Result, &queued); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// A notified message is presented without model-context injection.
+	notifiedResp := client.call(t, protocol.MethodMessageSend, map[string]any{
+		"commandId": "cmd_acceptance000000000000000006",
+		"to":        map[string]any{"sessionId": "ses_hermes0000000000000000000000"},
+		"body":      map[string]any{"type": "text", "text": "notified"},
+		"delivery":  map[string]any{"mode": "notify", "wake": "none", "onUnsupported": "reject"},
+	})
+	if notifiedResp.Error != nil {
+		t.Fatalf("notify send failed: %v", notifiedResp.Error)
+	}
+	var notified struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := json.Unmarshal(notifiedResp.Result, &notified); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Both messages reached the recipient's durable inbox, in submission
+	// order.
+	inboxResp := client.call(t, protocol.MethodMessageListPending, map[string]any{
+		"sessionId": "ses_hermes0000000000000000000000",
+	})
+	if inboxResp.Error != nil {
+		t.Fatalf("listPending failed: %v", inboxResp.Error)
+	}
+	var inbox struct {
+		Messages []protocol.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(inboxResp.Result, &inbox); err != nil {
+		t.Fatalf("decode inbox: %v", err)
+	}
+	if len(inbox.Messages) != 2 {
+		t.Fatalf("expected 2 messages in the inbox, got %d", len(inbox.Messages))
+	}
+	if inbox.Messages[0].Delivery.Mode != protocol.DeliveryQueue {
+		t.Errorf("first message mode = %q, want queue", inbox.Messages[0].Delivery.Mode)
+	}
+	if inbox.Messages[1].Delivery.Mode != protocol.DeliveryNotify {
+		t.Errorf("second message mode = %q, want notify", inbox.Messages[1].Delivery.Mode)
+	}
+
+	// The original delivery intent is retained on the message.
+	if inbox.Messages[0].Delivery.Mode != protocol.DeliveryQueue {
+		t.Error("the queued message lost its delivery intent")
+	}
+}
+
+// Test_Acceptance05_OutcomesDistinguishable covers acceptance criterion 5:
+// delivery outcomes are distinguishable from acknowledgment and task
+// completion.
+//
+// The acknowledgment reports admission. The receipt trail reports what
+// happened. "handled" does not mean the task was completed correctly.
+func Test_Acceptance05_OutcomesDistinguishable(t *testing.T) {
+	env := startAcceptanceHost(t)
+
+	env.registerSession("ses_hermes0000000000000000000000", "hermes-agent", "hermes")
+
+	client := dialRPC(t, env.socketPath)
+
+	sendResp := client.call(t, protocol.MethodMessageSend, map[string]any{
+		"commandId": "cmd_acceptance000000000000000007",
+		"to":        map[string]any{"sessionId": "ses_hermes0000000000000000000000"},
+		"body":      map[string]any{"type": "text", "text": "distinguish me"},
+		"delivery":  map[string]any{"mode": "notify", "wake": "none", "onUnsupported": "reject"},
+	})
+	if sendResp.Error != nil {
+		t.Fatalf("send failed: %v", sendResp.Error)
+	}
+	var sent struct {
+		MessageID string                 `json:"messageId"`
+		Status    protocol.ReceiptStatus `json:"status"`
+	}
+	if err := json.Unmarshal(sendResp.Result, &sent); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// The acknowledgment reports admission, not delivery.
+	if sent.Status != protocol.ReceiptAccepted {
+		t.Errorf("the acknowledgment reported %q, want accepted", sent.Status)
+	}
+
+	// The receipt trail is a separate, ordered record of what happened.
+	statusResp := client.call(t, protocol.MethodMessageStatus, map[string]any{
+		"messageId": sent.MessageID,
+	})
+	if statusResp.Error != nil {
+		t.Fatalf("status failed: %v", statusResp.Error)
+	}
+	var status struct {
+		Receipts []protocol.Receipt `json:"receipts"`
+	}
+	if err := json.Unmarshal(statusResp.Result, &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if len(status.Receipts) == 0 {
+		t.Fatal("no receipts were recorded")
+	}
+	if status.Receipts[0].Status != protocol.ReceiptAccepted {
+		t.Errorf("the first receipt is %q, want accepted", status.Receipts[0].Status)
+	}
+
+	// The recipient reports that it presented the message, which is
+	// distinct from the acknowledgment.
+	reportResp := client.call(t, protocol.MethodMessageReport, map[string]any{
+		"messageId": sent.MessageID,
+		"status":    "presented",
+		"detail":    "presented by the notification handler",
+	})
+	if reportResp.Error != nil {
+		t.Fatalf("report failed: %v", reportResp.Error)
+	}
+
+	statusResp = client.call(t, protocol.MethodMessageStatus, map[string]any{
+		"messageId": sent.MessageID,
+	})
+	if err := json.Unmarshal(statusResp.Result, &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if len(status.Receipts) < 2 {
+		t.Fatalf("expected at least 2 receipts, got %d", len(status.Receipts))
+	}
+	last := status.Receipts[len(status.Receipts)-1]
+	if last.Status != protocol.ReceiptPresented {
+		t.Errorf("the last receipt is %q, want presented", last.Status)
+	}
+
+	// "handled" is a separate state from "presented", and neither means
+	// the task was completed correctly.
+	client.call(t, protocol.MethodMessageReport, map[string]any{
+		"messageId": sent.MessageID,
+		"status":    "handled",
+		"detail":    "the recipient acknowledged the message",
+	})
+	statusResp = client.call(t, protocol.MethodMessageStatus, map[string]any{
+		"messageId": sent.MessageID,
+	})
+	if err := json.Unmarshal(statusResp.Result, &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	last = status.Receipts[len(status.Receipts)-1]
+	if last.Status != protocol.ReceiptHandled {
+		t.Errorf("the last receipt is %q, want handled", last.Status)
+	}
+	if last.Status == protocol.ReceiptInjected {
+		t.Error("handled was reported as injected")
+	}
+}
+
+// Test_Acceptance10_CapabilitiesReportedHonestly covers acceptance criterion
+// 10: unsupported capabilities are accurately reported rather than falsely
+// emulated.
+func Test_Acceptance10_CapabilitiesReportedHonestly(t *testing.T) {
+	env := startAcceptanceHost(t)
+
+	// A session that claims only what it supports.
+	client := dialRPC(t, env.socketPath)
+	resp := client.call(t, protocol.MethodSessionRegister, map[string]any{
+		"sessionId":      "ses_honest000000000000000000000",
+		"instanceId":     "ins_honest0000000000000000000",
+		"alias":          "honest-agent",
+		"harness":        "hermes",
+		"harnessVersion": "1.0.0",
+		"capabilities": []map[string]any{
+			{"id": "delivery.notify", "support": "native"},
+			{"id": "delivery.queue", "support": "native"},
+			{
+				"id":          "delivery.steer",
+				"support":     "unsupported",
+				"limitations": []string{"the harness exposes no active-turn injection point"},
+			},
+		},
+		"deliveryModes": []string{"notify", "queue"},
+	})
+	if resp.Error != nil {
+		t.Fatalf("register failed: %v", resp.Error)
+	}
+
+	// Another peer reads the claims and sees the honest answer.
+	reader := dialRPC(t, env.socketPath)
+	capsResp := reader.call(t, protocol.MethodPeerCapabilities, map[string]any{
+		"sessionId": "ses_honest000000000000000000000",
+	})
+	if capsResp.Error != nil {
+		t.Fatalf("peer/capabilities failed: %v", capsResp.Error)
+	}
+	var caps struct {
+		Capabilities []protocol.Capability `json:"capabilities"`
+	}
+	if err := json.Unmarshal(capsResp.Result, &caps); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+
+	var steer protocol.Capability
+	found := false
+	for _, c := range caps.Capabilities {
+		if c.ID == protocol.CapDeliverySteer {
+			steer = c
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the steer capability was not advertised at all")
+	}
+	if steer.Support != protocol.SupportUnsupported {
+		t.Errorf("steer support = %q, want unsupported", steer.Support)
+	}
+	if len(steer.Limitations) == 0 {
+		t.Error("the unsupported capability carries no limitation")
+	}
+
+	// A peer that needs steering cannot negotiate for it, so the failure
+	// is explicit rather than a silent misbehaviour.
+	helloResp := reader.call(t, protocol.MethodHello, map[string]any{
+		"require": []string{"delivery.steer"},
+	})
+	if helloResp.Error == nil {
+		t.Fatal("a negotiation requiring steering was accepted")
+	}
+	if helloResp.Error.Code != protocol.CodeUnsupported {
+		t.Errorf("error code = %d, want %d (unsupported)", helloResp.Error.Code, protocol.CodeUnsupported)
+	}
+}
