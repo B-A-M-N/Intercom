@@ -372,6 +372,11 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 		}
 	}
 
+	// A message that may enter the model's context carries its provenance,
+	// so the recipient can tell peer-supplied content from the user's own
+	// instructions (ICSP-001 section 11.3).
+	provenance := protocol.PeerProvenance(msg, n.principalIDFor(ctx, msg.From))
+
 	switch effective {
 	case protocol.DeliveryNotify:
 		res, err := ad.Notify(ctx, msg.To, msg)
@@ -381,7 +386,10 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 		}
 		n.recordReceipt(ctx, msg, res.Status, res.Detail)
 	case protocol.DeliveryQueue, protocol.DeliverySteer:
-		res, err := ad.Deliver(ctx, msg.To, msg)
+		// The injected content is rendered with its provenance attached.
+		injected := msg
+		injected.Body = provenance.RenderAsPeerContent(msg.Body)
+		res, err := ad.Deliver(ctx, msg.To, injected)
 		if err != nil {
 			if errors.Is(err, adapter.ErrUnsupported) {
 				n.recordReceipt(ctx, msg, protocol.ReceiptRejected, err.Error())

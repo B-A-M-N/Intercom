@@ -280,6 +280,65 @@ type MessageBody struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// Provenance identifies a message as peer-supplied content.
+//
+// Messages injected into model context MUST retain provenance identifying
+// them as peer-supplied content (ICSP-001 section 11.3). An adapter that
+// injects a message uses this to mark the content, so a model can tell a
+// peer's instruction from the user's own.
+type Provenance struct {
+	// Source identifies the kind of content. It is always
+	// "peer-message" for content that came from another agent.
+	Source string `json:"source"`
+	// FromSession is the session that sent the message.
+	FromSession string `json:"fromSession"`
+	// FromPrincipal is the authenticated principal that sent it.
+	FromPrincipal string `json:"fromPrincipal,omitempty"`
+	// MessageID is the durable identity of the message.
+	MessageID string `json:"messageId"`
+	// ReceivedAt is when the message was accepted.
+	ReceivedAt time.Time `json:"receivedAt"`
+}
+
+// ProvenanceSourcePeer is the source value for peer-supplied content.
+const ProvenanceSourcePeer = "peer-message"
+
+// PeerProvenance builds the provenance for a peer-supplied message.
+func PeerProvenance(msg Message, principalID string) Provenance {
+	return Provenance{
+		Source:        ProvenanceSourcePeer,
+		FromSession:   msg.From,
+		FromPrincipal: principalID,
+		MessageID:     msg.MessageID,
+		ReceivedAt:    msg.CreatedAt,
+	}
+}
+
+// RenderAsPeerContent renders a message body for injection into a model's
+// context, with its provenance attached.
+//
+// The wrapper is what makes the content visibly peer-supplied rather than
+// an instruction from the user or the system. It is a rendering, not a
+// claim that the content is safe: the content itself is still untrusted
+// peer data.
+func (p Provenance) RenderAsPeerContent(body MessageBody) MessageBody {
+	payload := map[string]any{
+		"provenance": p,
+		"body":       body,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		// The body could not be re-encoded, so the original content is
+		// preserved with an explicit provenance marker.
+		return MessageBody{Type: body.Type, Text: body.Text, Data: json.RawMessage(`{}`)}
+	}
+	return MessageBody{
+		Type: "peer-message",
+		Text: body.Text,
+		Data: encoded,
+	}
+}
+
 // Delivery describes the requested delivery semantics of a message.
 type Delivery struct {
 	Mode          DeliveryMode      `json:"mode"`

@@ -104,6 +104,19 @@ func (n *Node) HostID() string { return n.hostID }
 // PrincipalID returns this node's authenticated principal.
 func (n *Node) PrincipalID() string { return n.principalID }
 
+// principalIDFor returns the authenticated principal behind a session.
+//
+// The principal is looked up from the peer registry rather than assumed, so
+// the provenance of an injected message names the principal that actually
+// sent it.
+func (n *Node) principalIDFor(ctx context.Context, sessionID string) string {
+	rec, err := n.store.GetSession(ctx, sessionID)
+	if err != nil {
+		return ""
+	}
+	return rec.PrincipalID
+}
+
 // Config returns the node's configuration.
 func (n *Node) Config() config.Config { return n.cfg }
 

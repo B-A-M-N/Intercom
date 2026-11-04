@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -425,4 +426,82 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// Test_InjectedMessagesRetainProvenance covers the provenance requirement of
+// spec section 11.3.
+//
+// Messages injected into model context MUST retain provenance identifying
+// them as peer-supplied content.
+func Test_InjectedMessagesRetainProvenance(t *testing.T) {
+	e := newEnv(t)
+
+	if _, err := e.send(e.aliceSender(), e.bobID, "peer content", "cmd_provenance00000000000000001", protocol.DeliveryQueue); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.delivered) == 1 })
+	if !ok {
+		t.Fatal("the recipient did not receive the message")
+	}
+
+	injected := e.bob.delivered[0]
+
+	// The rendered body is marked as peer-supplied content.
+	if injected.Body.Type != "peer-message" {
+		t.Errorf("injected body type = %q, want peer-message", injected.Body.Type)
+	}
+	if len(injected.Body.Data) == 0 {
+		t.Fatal("the injected body carries no provenance data")
+	}
+
+	var payload struct {
+		Provenance protocol.Provenance  `json:"provenance"`
+		Body       protocol.MessageBody `json:"body"`
+	}
+	if err := json.Unmarshal(injected.Body.Data, &payload); err != nil {
+		t.Fatalf("decode provenance: %v", err)
+	}
+	if payload.Provenance.Source != protocol.ProvenanceSourcePeer {
+		t.Errorf("provenance source = %q, want %q", payload.Provenance.Source, protocol.ProvenanceSourcePeer)
+	}
+	if payload.Provenance.FromSession != e.aliceID {
+		t.Errorf("provenance sender = %q, want %q", payload.Provenance.FromSession, e.aliceID)
+	}
+	if payload.Provenance.MessageID == "" {
+		t.Error("provenance carries no message id")
+	}
+
+	// The original content is preserved inside the wrapper.
+	if payload.Body.Text != "peer content" {
+		t.Errorf("wrapped body text = %q", payload.Body.Text)
+	}
+
+	// The underlying durable message keeps the original body, so the
+	// rendering is an injection-time concern and not a storage change.
+	stored, err := e.store.GetMessage(e.ctx, injected.MessageID)
+	if err != nil {
+		t.Fatalf("get message: %v", err)
+	}
+	if stored.Body.Type != "text" {
+		t.Errorf("stored body type = %q, want text", stored.Body.Type)
+	}
+}
+
+// Test_NotificationIsNotWrapped covers that the provenance wrapper applies
+// to model-context injection, not to notification surfaces.
+func Test_NotificationIsNotWrapped(t *testing.T) {
+	e := newEnv(t)
+
+	if _, err := e.send(e.aliceSender(), e.bobID, "a note", "cmd_provenance00000000000000002", protocol.DeliveryNotify); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.notified) == 1 })
+	if !ok {
+		t.Fatal("the recipient was not notified")
+	}
+	if e.bob.notified[0].Body.Type != "text" {
+		t.Errorf("notified body type = %q, want text", e.bob.notified[0].Body.Type)
+	}
 }
