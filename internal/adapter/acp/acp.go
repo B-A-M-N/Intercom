@@ -15,10 +15,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 
-	"github.com/bamn/intercom/internal/adapter"
 	"github.com/bamn/intercom/internal/node"
 	"github.com/bamn/intercom/internal/protocol"
 )
@@ -95,6 +93,24 @@ func (s *Server) initializeResult() InitializeResult {
 // method. Standard ACP methods keep their own semantics; the extension only
 // adds new methods.
 func (s *Server) Handle(ctx context.Context, method string, params json.RawMessage) (any, *protocol.RPCError) {
+	return s.handle(ctx, method, params)
+}
+
+// HandleValue dispatches a request whose parameters are supplied as a Go
+// value. It marshals the parameters and delegates to Handle.
+func (s *Server) HandleValue(ctx context.Context, method string, params any) (any, *protocol.RPCError) {
+	if params == nil {
+		return s.handle(ctx, method, nil)
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "invalid params: %v", err)
+	}
+	return s.handle(ctx, method, raw)
+}
+
+// handle performs the dispatch.
+func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *protocol.RPCError) {
 	switch method {
 	case "initialize":
 		return s.initializeResult(), nil
@@ -140,13 +156,13 @@ func (s *Server) hello() (HelloResult, *protocol.RPCError) {
 	}, nil
 }
 
-// peerListParams are the parameters of _intercom/peer/list.
-type peerListParams struct {
+// PeerListParams are the parameters of _intercom/peer/list.
+type PeerListParams struct {
 	Limit int `json:"limit,omitempty"`
 }
 
-// peerListResult is the response to _intercom/peer/list.
-type peerListResult struct {
+// PeerListResult is the response to _intercom/peer/list.
+type PeerListResult struct {
 	Peers []protocol.PeerInfo `json:"peers"`
 }
 
@@ -156,23 +172,23 @@ func (s *Server) peerList(ctx context.Context) (any, *protocol.RPCError) {
 	if err != nil {
 		return nil, protocol.Errorf(protocol.CodeInternalError, "discovery failed: %v", err)
 	}
-	return peerListResult{Peers: peers}, nil
+	return PeerListResult{Peers: peers}, nil
 }
 
-// peerResolveParams are the parameters of _intercom/peer/resolve.
-type peerResolveParams struct {
+// PeerResolveParams are the parameters of _intercom/peer/resolve.
+type PeerResolveParams struct {
 	Alias   string `json:"alias,omitempty"`
 	Session string `json:"sessionId,omitempty"`
 }
 
-// peerResolveResult is the response to _intercom/peer/resolve.
-type peerResolveResult struct {
+// PeerResolveResult is the response to _intercom/peer/resolve.
+type PeerResolveResult struct {
 	Peer protocol.PeerInfo `json:"peer"`
 }
 
 // peerResolve resolves an alias or session identifier.
 func (s *Server) peerResolve(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p peerResolveParams
+	var p PeerResolveParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -190,23 +206,23 @@ func (s *Server) peerResolve(ctx context.Context, params json.RawMessage) (any, 
 		}
 		return nil, protocol.Errorf(protocol.CodeInternalError, "resolve failed: %v", err)
 	}
-	return peerResolveResult{Peer: peer}, nil
+	return PeerResolveResult{Peer: peer}, nil
 }
 
-// peerCapabilitiesParams are the parameters of _intercom/peer/capabilities.
-type peerCapabilitiesParams struct {
+// PeerCapabilitiesParams are the parameters of _intercom/peer/capabilities.
+type PeerCapabilitiesParams struct {
 	Session string `json:"sessionId"`
 }
 
-// peerCapabilitiesResult is the response to _intercom/peer/capabilities.
-type peerCapabilitiesResult struct {
+// PeerCapabilitiesResult is the response to _intercom/peer/capabilities.
+type PeerCapabilitiesResult struct {
 	SessionID    string                `json:"sessionId"`
 	Capabilities []protocol.Capability `json:"capabilities"`
 }
 
 // peerCapabilities retrieves a peer's effective capabilities.
 func (s *Server) peerCapabilities(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p peerCapabilitiesParams
+	var p PeerCapabilitiesParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -214,23 +230,23 @@ func (s *Server) peerCapabilities(ctx context.Context, params json.RawMessage) (
 	if err != nil {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", p.Session)
 	}
-	return peerCapabilitiesResult{SessionID: p.Session, Capabilities: caps}, nil
+	return PeerCapabilitiesResult{SessionID: p.Session, Capabilities: caps}, nil
 }
 
-// peerPresenceParams are the parameters of _intercom/peer/presence.
-type peerPresenceParams struct {
+// PeerPresenceParams are the parameters of _intercom/peer/presence.
+type PeerPresenceParams struct {
 	Session string `json:"sessionId"`
 }
 
-// peerPresenceResult is the response to _intercom/peer/presence.
-type peerPresenceResult struct {
+// PeerPresenceResult is the response to _intercom/peer/presence.
+type PeerPresenceResult struct {
 	SessionID string                 `json:"sessionId"`
 	Presence  protocol.PresenceState `json:"presence"`
 }
 
 // peerPresence queries a peer's last observed presence.
 func (s *Server) peerPresence(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p peerPresenceParams
+	var p PeerPresenceParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -238,11 +254,11 @@ func (s *Server) peerPresence(ctx context.Context, params json.RawMessage) (any,
 	if err != nil {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", p.Session)
 	}
-	return peerPresenceResult{SessionID: p.Session, Presence: presence}, nil
+	return PeerPresenceResult{SessionID: p.Session, Presence: presence}, nil
 }
 
-// messageSendParams are the parameters of _intercom/message/send.
-type messageSendParams struct {
+// MessageSendParams are the parameters of _intercom/message/send.
+type MessageSendParams struct {
 	CommandID     string               `json:"commandId"`
 	To            json.RawMessage      `json:"to"`
 	Body          protocol.MessageBody `json:"body"`
@@ -253,10 +269,10 @@ type messageSendParams struct {
 	Metadata      map[string]any       `json:"metadata,omitempty"`
 }
 
-// messageSendResult is the response to _intercom/message/send.
+// MessageSendResult is the response to _intercom/message/send.
 //
 // It reports durable admission, not recipient processing.
-type messageSendResult struct {
+type MessageSendResult struct {
 	CommandID string                 `json:"commandId"`
 	MessageID string                 `json:"messageId"`
 	Status    protocol.ReceiptStatus `json:"status"`
@@ -264,7 +280,7 @@ type messageSendResult struct {
 
 // messageSend submits a peer message.
 func (s *Server) messageSend(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p messageSendParams
+	var p MessageSendParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -287,19 +303,19 @@ func (s *Server) messageSend(ctx context.Context, params json.RawMessage) (any, 
 	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return messageSendResult{CommandID: res.CommandID, MessageID: res.MessageID, Status: res.Status}, nil
+	return MessageSendResult{CommandID: res.CommandID, MessageID: res.MessageID, Status: res.Status}, nil
 }
 
-// messageReplyParams are the parameters of _intercom/message/reply.
-type messageReplyParams struct {
+// MessageReplyParams are the parameters of _intercom/message/reply.
+type MessageReplyParams struct {
 	CommandID     string `json:"commandId"`
 	MessageID     string `json:"messageId"`
 	Text          string `json:"text"`
 	CorrelationID string `json:"correlationId,omitempty"`
 }
 
-// messageReplyResult is the response to _intercom/message/reply.
-type messageReplyResult struct {
+// MessageReplyResult is the response to _intercom/message/reply.
+type MessageReplyResult struct {
 	CommandID string                 `json:"commandId"`
 	MessageID string                 `json:"messageId"`
 	Status    protocol.ReceiptStatus `json:"status"`
@@ -307,7 +323,7 @@ type messageReplyResult struct {
 
 // messageReply sends a correlated reply.
 func (s *Server) messageReply(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p messageReplyParams
+	var p MessageReplyParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -315,16 +331,16 @@ func (s *Server) messageReply(ctx context.Context, params json.RawMessage) (any,
 	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return messageReplyResult{CommandID: res.CommandID, MessageID: res.MessageID, Status: res.Status}, nil
+	return MessageReplyResult{CommandID: res.CommandID, MessageID: res.MessageID, Status: res.Status}, nil
 }
 
-// messageStatusParams are the parameters of _intercom/message/status.
-type messageStatusParams struct {
+// MessageStatusParams are the parameters of _intercom/message/status.
+type MessageStatusParams struct {
 	MessageID string `json:"messageId"`
 }
 
-// messageStatusResult is the response to _intercom/message/status.
-type messageStatusResult struct {
+// MessageStatusResult is the response to _intercom/message/status.
+type MessageStatusResult struct {
 	MessageID string                 `json:"messageId"`
 	Status    protocol.ReceiptStatus `json:"status"`
 	Receipts  []protocol.Receipt     `json:"receipts"`
@@ -332,7 +348,7 @@ type messageStatusResult struct {
 
 // messageStatus reads delivery receipts.
 func (s *Server) messageStatus(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p messageStatusParams
+	var p MessageStatusParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -343,20 +359,20 @@ func (s *Server) messageStatus(ctx context.Context, params json.RawMessage) (any
 	if len(receipts) == 0 {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown messageId %q", p.MessageID)
 	}
-	return messageStatusResult{
+	return MessageStatusResult{
 		MessageID: p.MessageID,
 		Status:    receipts[len(receipts)-1].Status,
 		Receipts:  receipts,
 	}, nil
 }
 
-// sessionStateParams are the parameters of _intercom/session/state.
-type sessionStateParams struct {
+// SessionStateParams are the parameters of _intercom/session/state.
+type SessionStateParams struct {
 	Session string `json:"sessionId"`
 }
 
-// sessionStateResult is the response to _intercom/session/state.
-type sessionStateResult struct {
+// SessionStateResult is the response to _intercom/session/state.
+type SessionStateResult struct {
 	SessionID string                `json:"sessionId"`
 	State     protocol.SessionState `json:"state"`
 	Recovery  string                `json:"recovery"`
@@ -365,7 +381,7 @@ type sessionStateResult struct {
 
 // sessionState queries a session's state and recovery classification.
 func (s *Server) sessionState(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p sessionStateParams
+	var p SessionStateParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -373,7 +389,7 @@ func (s *Server) sessionState(ctx context.Context, params json.RawMessage) (any,
 	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return sessionStateResult{
+	return SessionStateResult{
 		SessionID: snap.SessionID,
 		State:     snap.State,
 		Recovery:  snap.Recovery,
@@ -381,14 +397,14 @@ func (s *Server) sessionState(ctx context.Context, params json.RawMessage) (any,
 	}, nil
 }
 
-// sessionSnapshotResult is the response to _intercom/session/snapshot.
-type sessionSnapshotResult struct {
+// SessionSnapshotResult is the response to _intercom/session/snapshot.
+type SessionSnapshotResult struct {
 	Snapshot protocol.Snapshot `json:"snapshot"`
 }
 
 // sessionSnapshot obtains a coherent state projection.
 func (s *Server) sessionSnapshot(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p sessionStateParams
+	var p SessionStateParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -396,21 +412,21 @@ func (s *Server) sessionSnapshot(ctx context.Context, params json.RawMessage) (a
 	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return sessionSnapshotResult{Snapshot: snap}, nil
+	return SessionSnapshotResult{Snapshot: snap}, nil
 }
 
-// sessionReplayParams are the parameters of _intercom/session/replay.
-type sessionReplayParams struct {
+// SessionReplayParams are the parameters of _intercom/session/replay.
+type SessionReplayParams struct {
 	Session string `json:"sessionId"`
 	Cursor  uint64 `json:"cursor,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
 }
 
-// sessionReplayResult is the response to _intercom/session/replay.
+// SessionReplayResult is the response to _intercom/session/replay.
 //
 // CursorGap is set when the requested history was compacted away, so the
 // client knows to recover through a snapshot rather than assume continuity.
-type sessionReplayResult struct {
+type SessionReplayResult struct {
 	SessionID         string                   `json:"sessionId"`
 	Events            []protocol.EventEnvelope `json:"events"`
 	Cursor            uint64                   `json:"cursor"`
@@ -421,7 +437,7 @@ type sessionReplayResult struct {
 
 // sessionReplay replays the event stream.
 func (s *Server) sessionReplay(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p sessionReplayParams
+	var p SessionReplayParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -429,7 +445,7 @@ func (s *Server) sessionReplay(ctx context.Context, params json.RawMessage) (any
 	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return sessionReplayResult{
+	return SessionReplayResult{
 		SessionID:         p.Session,
 		Events:            res.Events,
 		Cursor:            res.Cursor,
@@ -439,20 +455,20 @@ func (s *Server) sessionReplay(ctx context.Context, params json.RawMessage) (any
 	}, nil
 }
 
-// sessionSubscribeParams are the parameters of _intercom/session/subscribe.
-type sessionSubscribeParams struct {
+// SessionSubscribeParams are the parameters of _intercom/session/subscribe.
+type SessionSubscribeParams struct {
 	Session string `json:"sessionId"`
 }
 
-// sessionSubscribeResult is the response to _intercom/session/subscribe.
-type sessionSubscribeResult struct {
+// SessionSubscribeResult is the response to _intercom/session/subscribe.
+type SessionSubscribeResult struct {
 	SessionID  string `json:"sessionId"`
 	Subscribed bool   `json:"subscribed"`
 }
 
 // sessionSubscribe subscribes to subsequent changes.
 func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
-	var p sessionSubscribeParams
+	var p SessionSubscribeParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
@@ -460,7 +476,7 @@ func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
 	}
 	s.n.Subscribe(p.Session)
-	return sessionSubscribeResult{SessionID: p.Session, Subscribed: true}, nil
+	return SessionSubscribeResult{SessionID: p.Session, Subscribed: true}, nil
 }
 
 // sender returns the transport-authenticated sender identity.
@@ -533,8 +549,3 @@ func toRPCError(err error) *protocol.RPCError {
 
 // Namespace returns the Intercom extension namespace.
 func Namespace() string { return strings.TrimSuffix(protocol.IntercomMethodPrefix, "/") }
-
-// ensure the adapter package is referenced so the capability vocabulary stays
-// aligned with the adapter contract.
-var _ = adapter.ModeNative
-var _ = fmt.Sprintf

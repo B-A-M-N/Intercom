@@ -203,10 +203,20 @@ func (c *unixConn) WriteFrame(ctx context.Context, frame []byte) error {
 func (c *unixConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
 // Write implements io.Writer for callers that want raw byte access.
+//
+// The write is flushed before returning: a caller writing a complete frame
+// expects the peer to receive it without a separate flush step.
 func (c *unixConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.writer.Write(p)
+	n, err := c.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if err := c.writer.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // Close shuts the connection down.
