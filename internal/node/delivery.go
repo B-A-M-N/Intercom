@@ -340,7 +340,7 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 	matrix := capabilityMatrix(ad)
 	if level, supported := matrix.Supports(requested.Mode); !supported {
 		switch requested.OnUnsupported {
-		case protocol.UnsupportedDowngrade, protocol.UnsupportedNotify:
+		case protocol.UnsupportedDowngrade:
 			downgraded, ok := matrix.DowngradeTo(requested.Mode)
 			if !ok {
 				n.recordReceipt(ctx, msg, protocol.ReceiptRejected,
@@ -351,6 +351,20 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 			_ = level
 			n.recordReceipt(ctx, msg, protocol.ReceiptAccepted,
 				adapter.FormatDowngrade(requested.Mode, downgraded))
+		case protocol.UnsupportedNotify:
+			// The notify fallback is notification-only, not a general
+			// downgrade. Queueing would still make the message available
+			// for the next turn, which is a different operation from the
+			// notification the sender asked to fall back to.
+			if _, ok := matrix.Supports(protocol.DeliveryNotify); !ok {
+				n.recordReceipt(ctx, msg, protocol.ReceiptRejected,
+					fmt.Sprintf("delivery mode %q is unsupported by the recipient harness and notification is unavailable", requested.Mode))
+				return
+			}
+			effective = protocol.DeliveryNotify
+			_ = level
+			n.recordReceipt(ctx, msg, protocol.ReceiptAccepted,
+				adapter.FormatDowngrade(requested.Mode, protocol.DeliveryNotify))
 		default:
 			n.recordReceipt(ctx, msg, protocol.ReceiptRejected,
 				fmt.Sprintf("delivery mode %q is unsupported by the recipient harness", requested.Mode))

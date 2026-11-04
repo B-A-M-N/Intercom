@@ -325,3 +325,104 @@ func Test_ContextCancellationPropagates(t *testing.T) {
 		t.Fatal("a cancelled context still admitted a message")
 	}
 }
+
+// Test_NotifyFallbackIsNotificationOnly covers the fallback semantics of
+// spec section 5.3.
+//
+// The notify fallback means notification-only, not a general downgrade. A
+// queue fallback would still make the message available for the next turn,
+// which is a different operation from the notification the sender asked to
+// fall back to.
+func Test_NotifyFallbackIsNotificationOnly(t *testing.T) {
+	e := newEnv(t)
+
+	// Bob's adapter supports notify and queue but not steer.
+	res, err := e.node.Send(e.ctx, e.aliceSender(), node.SendRequest{
+		CommandID: "cmd_fallback00000000000000000001",
+		To:        e.bobID,
+		Body:      protocol.MessageBody{Type: "text", Text: "fall back"},
+		Delivery: protocol.Delivery{
+			Mode:          protocol.DeliverySteer,
+			Wake:          protocol.WakeNone,
+			OnUnsupported: protocol.UnsupportedNotify,
+		},
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ok := waitFor(t, 2*time.Second, func() bool {
+		receipts, err := e.node.Receipts(e.ctx, res.MessageID)
+		if err != nil || len(receipts) == 0 {
+			return false
+		}
+		return receipts[len(receipts)-1].Status == protocol.ReceiptPresented
+	})
+	if !ok {
+		receipts, _ := e.node.Receipts(e.ctx, res.MessageID)
+		t.Fatalf("the notify fallback did not fall back to notification: %+v", receipts)
+	}
+
+	// The message was presented, not queued for a turn.
+	if len(e.bob.delivered) != 0 {
+		t.Errorf("the fallback delivered %d messages to the turn path, want 0", len(e.bob.delivered))
+	}
+	if len(e.bob.notified) != 1 {
+		t.Errorf("the fallback produced %d notifications, want 1", len(e.bob.notified))
+	}
+}
+
+// Test_DowngradeFallbackIsExplicitlyReported covers the downgrade reporting
+// requirement of spec section 5.3.
+func Test_DowngradeFallbackIsExplicitlyReported(t *testing.T) {
+	e := newEnv(t)
+
+	res, err := e.node.Send(e.ctx, e.aliceSender(), node.SendRequest{
+		CommandID: "cmd_fallback00000000000000000002",
+		To:        e.bobID,
+		Body:      protocol.MessageBody{Type: "text", Text: "downgrade"},
+		Delivery: protocol.Delivery{
+			Mode:          protocol.DeliverySteer,
+			Wake:          protocol.WakeNone,
+			OnUnsupported: protocol.UnsupportedDowngrade,
+		},
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ok := waitFor(t, 2*time.Second, func() bool {
+		receipts, err := e.node.Receipts(e.ctx, res.MessageID)
+		if err != nil || len(receipts) < 2 {
+			return false
+		}
+		return receipts[1].Detail != ""
+	})
+	if !ok {
+		t.Fatal("the downgrade was not reported")
+	}
+
+	receipts, err := e.node.Receipts(e.ctx, res.MessageID)
+	if err != nil {
+		t.Fatalf("receipts: %v", err)
+	}
+	detail := receipts[1].Detail
+	if !contains(detail, "downgraded") {
+		t.Errorf("the downgrade receipt does not report the downgrade: %q", detail)
+	}
+}
+
+// contains reports whether s contains sub.
+func contains(s, sub string) bool {
+	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
+}
+
+// indexOf returns the index of sub in s, or -1.
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
