@@ -110,14 +110,23 @@ func run() error {
 	}
 	defer ln.Close()
 
-	srv := transport.NewServer(func(ctx context.Context, peer transport.PeerIdentity, method string, params json.RawMessage) (any, *protocol.RPCError) {
+	var srv *transport.Server
+	srv = transport.NewServer(func(ctx context.Context, peer transport.PeerIdentity, conn transport.Conn, method string, params json.RawMessage) (any, *protocol.RPCError) {
 		// The peer identity comes from the transport, never from the payload.
 		principal := peer.PrincipalID
 		if principal == "" {
 			principal = cfg.PrincipalID
 		}
 		session := peerSession(peer, cfg, *sessionID)
-		return acp.NewServer(n, principal, session).Handle(ctx, method, params)
+
+		// The ACP server emits event notifications for subscriptions. They
+		// go to the connection that made the request, so a subscription only
+		// reaches the client that asked for it.
+		ext := acp.NewServer(n, principal, session)
+		ext.SetEmitter(func(ctx context.Context, method string, params any) {
+			srv.Notify(conn, method, params)
+		})
+		return ext.Handle(ctx, method, params)
 	})
 	defer srv.Close()
 

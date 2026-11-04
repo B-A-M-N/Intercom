@@ -32,6 +32,9 @@ type Server struct {
 	peerSession string
 	// peerPrincipal is the principal established by the transport.
 	peerPrincipal string
+	// emit sends a server-initiated notification to the connected client.
+	// It is nil when the server is used without a transport.
+	emit func(ctx context.Context, method string, params any)
 }
 
 // NewServer creates an ACP extension server bound to a node.
@@ -40,6 +43,16 @@ type Server struct {
 // request payload.
 func NewServer(n *node.Node, peerPrincipal, peerSession string) *Server {
 	return &Server{n: n, peerPrincipal: peerPrincipal, peerSession: peerSession}
+}
+
+// SetEmitter installs the function used to send server-initiated
+// notifications to the connected client.
+//
+// Without an emitter, session/subscribe still records the subscription and
+// still replays the backlog into the subscriber channel, but the events are
+// not pushed onto the wire.
+func (s *Server) SetEmitter(emit func(ctx context.Context, method string, params any)) {
+	s.emit = emit
 }
 
 // InitializeResult is the response to the ACP initialize method.
@@ -451,13 +464,28 @@ func (s *Server) sessionReplay(ctx context.Context, params json.RawMessage) (any
 	if err != nil {
 		return nil, toRPCError(err)
 	}
+
+	// A cursor gap is an explicit recovery response, not a silently short
+	// history. The error carries the snapshot path and the earliest
+	// available sequence so the client knows how to recover coherently
+	// (ICSP-001 section 7.2).
+	if res.Gap {
+		return nil, protocol.Errorf(protocol.CodeCursorGap,
+			"the requested history has been compacted; recover through %q",
+			res.SnapshotPath).
+			WithData(map[string]any{
+				"sessionId":         p.Session,
+				"earliestAvailable": res.EarliestAvailable,
+				"requestedCursor":   p.Cursor,
+				"snapshotPath":      res.SnapshotPath,
+			})
+	}
+
 	return SessionReplayResult{
 		SessionID:         p.Session,
 		Events:            res.Events,
 		Cursor:            res.Cursor,
-		CursorGap:         res.Gap,
 		EarliestAvailable: res.EarliestAvailable,
-		SnapshotPath:      res.SnapshotPath,
 	}, nil
 }
 
@@ -473,6 +501,11 @@ type SessionSubscribeResult struct {
 }
 
 // sessionSubscribe subscribes to subsequent changes.
+//
+// The subscription is delivered over the same connection as the request, as
+// _intercom/event notifications. The backlog already recorded for the
+// session is sent first, so the client starts from a known point rather
+// than from an empty history (ICSP-001 section 7.2).
 func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
 	var p SessionSubscribeParams
 	if err := decodeParams(params, &p); err != nil {
@@ -481,8 +514,41 @@ func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (
 	if p.Session == "" {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
 	}
-	s.n.Subscribe(p.Session)
+
+	ch, err := s.n.Subscribe(ctx, p.Session)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+
+	// Stream receipts to the client as _intercom/event notifications.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				s.n.Unsubscribe(p.Session, ch)
+				return
+			case receipt, ok := <-ch:
+				if !ok {
+					return
+				}
+				s.sendEvent(ctx, p.Session, receipt)
+			}
+		}
+	}()
+
 	return SessionSubscribeResult{SessionID: p.Session, Subscribed: true}, nil
+}
+
+// sendEvent emits one event notification to the connected client.
+func (s *Server) sendEvent(ctx context.Context, sessionID string, receipt protocol.Receipt) {
+	if s.emit == nil {
+		return
+	}
+	payload := map[string]any{
+		"sessionId": sessionID,
+		"receipt":   receipt,
+	}
+	s.emit(ctx, protocol.MethodEvent, payload)
 }
 
 // sessionRegisterParams are the parameters of _intercom/session/register.

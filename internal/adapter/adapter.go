@@ -74,6 +74,16 @@ type Adapter interface {
 	// Notify presents or records a message without injecting its contents
 	// into the model's context.
 	Notify(ctx context.Context, sessionID string, msg protocol.Message) (DeliveryResult, error)
+
+	// Wake initiates or wakes the recipient's execution so that it acts on a
+	// message that has already been delivered.
+	//
+	// Wake is separate from delivery: the delivery mode decides what
+	// happens to the message, and the wake policy decides whether the
+	// recipient is started or woken (ICSP-001 section 5.3). An adapter that
+	// cannot wake its harness must return ErrUnsupported rather than
+	// pretending that a delivery was a wake.
+	Wake(ctx context.Context, sessionID string, msg protocol.Message) (DeliveryResult, error)
 }
 
 // Delivery modes a harness can claim. These map directly onto the support

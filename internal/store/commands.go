@@ -171,6 +171,28 @@ func (s *Store) GetCommand(ctx context.Context, commandID string) (CommandRecord
 	return rec, nil
 }
 
+// SetCommandState records a non-terminal state transition for a command.
+//
+// The lifecycle is received -> accepted -> executing -> settled. A command
+// may be rejected at admission or become abandoned during recovery.
+func (s *Store) SetCommandState(ctx context.Context, commandID string, state protocol.CommandState) error {
+	if !state.Valid() {
+		return fmt.Errorf("store: invalid command state %q", state)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE commands SET state = ?, updated_at = ? WHERE command_id = ?`,
+			state, time.Now().UTC().Format(TimestampLayout), commandID)
+		if err != nil {
+			return fmt.Errorf("store: set command state: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // SettleCommand records a terminal disposition for a command.
 func (s *Store) SettleCommand(ctx context.Context, commandID string, state protocol.CommandState, disposition string) error {
 	if !state.Valid() {

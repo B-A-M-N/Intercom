@@ -227,9 +227,6 @@ func (n *Node) Send(ctx context.Context, from Sender, req SendRequest) (SendResu
 	if err := n.store.SetCommandMessage(ctx, req.CommandID, stored.MessageID); err != nil {
 		return SendResult{}, err
 	}
-	if err := n.store.SettleCommand(ctx, req.CommandID, protocol.CommandSettled, "accepted"); err != nil {
-		return SendResult{}, err
-	}
 
 	// Journal the acceptance so the recipient's session history records it.
 	if _, err := n.store.AppendEvent(ctx, protocol.EventEnvelope{
@@ -239,6 +236,13 @@ func (n *Node) Send(ctx context.Context, from Sender, req SendRequest) (SendResu
 		Timestamp: created,
 		Payload:   mustJSON(map[string]any{"messageId": stored.MessageID, "commandId": req.CommandID}),
 	}, req.CommandID); err != nil {
+		return SendResult{}, err
+	}
+
+	// The command moves to executing before delivery is attempted, so the
+	// lifecycle is received -> accepted -> executing -> settled rather than
+	// jumping straight from accepted to settled.
+	if err := n.store.SetCommandState(ctx, req.CommandID, protocol.CommandExecuting); err != nil {
 		return SendResult{}, err
 	}
 
@@ -270,6 +274,10 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 		n.recordReceipt(ctx, msg, protocol.ReceiptUnknown, "recipient adapter is not connected; message remains in the durable inbox")
 		return
 	}
+
+	// The delivery mode decides what happens to the message. The wake
+	// policy is independent of it: it governs whether the recipient is
+	// initiated or woken to act on the message (ICSP-001 section 5.3).
 
 	// Resolve the effective mode against the recipient's honest capability
 	// matrix.
@@ -314,12 +322,21 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 			return
 		}
 		n.recordReceipt(ctx, msg, res.Status, res.Detail)
+
+		// A queued message does not start a turn by itself. The wake policy
+		// decides whether the recipient is initiated.
+		if effective == protocol.DeliveryQueue {
+			n.applyWake(ctx, ad, msg, requested.Wake)
+		}
 	default:
 		n.recordReceipt(ctx, msg, protocol.ReceiptRejected, "no delivery path selected")
 	}
 }
 
 // recordReceipt persists a receipt and notifies observers.
+//
+// A terminal receipt settles the command that admitted the message, so the
+// command lifecycle reaches a disposition rather than sitting in executing.
 func (n *Node) recordReceipt(ctx context.Context, msg protocol.Message, status protocol.ReceiptStatus, detail string) {
 	receipt := protocol.Receipt{
 		MessageID:  msg.MessageID,
@@ -336,6 +353,9 @@ func (n *Node) recordReceipt(ctx context.Context, msg protocol.Message, status p
 	if status == protocol.ReceiptDelivered {
 		_ = n.store.SetInboxState(ctx, msg.MessageID, store.InboxDelivered)
 	}
+	if status.Terminal() && msg.CommandID != "" {
+		_ = n.store.SettleCommand(ctx, msg.CommandID, protocol.CommandSettled, string(status))
+	}
 	if _, err := n.store.AppendEvent(ctx, protocol.EventEnvelope{
 		EventID:   mustID("evt"),
 		SessionID: msg.To,
@@ -346,6 +366,57 @@ func (n *Node) recordReceipt(ctx context.Context, msg protocol.Message, status p
 		return
 	}
 	n.notifyObservers(msg.To, receipt)
+}
+
+// applyWake initiates or wakes the recipient's execution, if the requested
+// wake policy calls for it.
+//
+// The wake policy is independent of the delivery mode (ICSP-001 section
+// 5.3). It governs initiating execution, not whether the message is
+// delivered:
+//
+//   - none: do not initiate or wake execution. The message stays available
+//     and the recipient picks it up itself.
+//   - if_idle: wake the recipient when it is idle.
+//   - next_safe_point: wake the recipient at an eligible safe point.
+//
+// A wake that is not satisfied is not an error. The message is already
+// delivered, so the receipt trail records the delivery and the wake is
+// simply not applicable right now.
+func (n *Node) applyWake(ctx context.Context, ad adapter.Adapter, msg protocol.Message, wake protocol.WakePolicy) {
+	switch wake {
+	case protocol.WakeIfIdle:
+		state, err := ad.State(ctx, msg.To)
+		if err != nil {
+			return
+		}
+		if state.State != protocol.SessionIdle && state.State != protocol.SessionCreated {
+			return
+		}
+	case protocol.WakeNextSafePoint:
+		state, err := ad.State(ctx, msg.To)
+		if err != nil {
+			return
+		}
+		if !state.SafePoint {
+			return
+		}
+	case "", protocol.WakeNone:
+		// The sender explicitly asked for no wake.
+		return
+	default:
+		return
+	}
+
+	res, err := ad.Wake(ctx, msg.To, msg)
+	if err != nil {
+		// A failed wake does not undo the delivery that already happened.
+		return
+	}
+	if res.Status == protocol.ReceiptRejected || res.Status == protocol.ReceiptUnknown {
+		return
+	}
+	n.recordReceipt(ctx, msg, res.Status, res.Detail)
 }
 
 // capabilityMatrix derives a delivery capability matrix from an adapter.
@@ -425,12 +496,41 @@ func (n *Node) MessageStatus(ctx context.Context, messageID string) (protocol.Re
 }
 
 // Subscribe returns a channel of receipts for a session.
-func (n *Node) Subscribe(sessionID string) <-chan protocol.Receipt {
-	ch := make(chan protocol.Receipt, 64)
+//
+// A subscriber receives every receipt recorded for that session, so a
+// client that subscribes sees the session's delivery history from the
+// moment it subscribed (ICSP-001 section 7.2).
+func (n *Node) Subscribe(ctx context.Context, sessionID string) (<-chan protocol.Receipt, error) {
+	if _, err := n.store.GetSession(ctx, sessionID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", sessionID)
+		}
+		return nil, err
+	}
+
+	ch := make(chan protocol.Receipt, 256)
+
+	// Replay the receipts already recorded, so the subscriber starts from a
+	// known point rather than from an empty history.
+	existing, err := n.store.ReceiptsForSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
 	n.obsMu.Lock()
 	n.observers[sessionID] = append(n.observers[sessionID], ch)
 	n.obsMu.Unlock()
-	return ch
+
+	for _, r := range existing {
+		select {
+		case ch <- r:
+		default:
+			// The backlog exceeded the buffer. The client can still recover
+			// the history through session/replay.
+		}
+	}
+
+	return ch, nil
 }
 
 // Unsubscribe removes a subscription channel.

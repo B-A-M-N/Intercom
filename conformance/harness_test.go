@@ -32,6 +32,7 @@ type fakeAdapter struct {
 	delivered []protocol.Message
 	notified  []protocol.Message
 	steerable bool
+	woken     []protocol.Message
 }
 
 func newFakeAdapter(modes ...protocol.DeliveryMode) *fakeAdapter {
@@ -70,6 +71,14 @@ func (f *fakeAdapter) Notify(ctx context.Context, sessionID string, msg protocol
 	return adapter.DeliveryResult{
 		Status: protocol.ReceiptPresented,
 		Detail: "presented by the notification handler",
+	}, nil
+}
+
+func (f *fakeAdapter) Wake(ctx context.Context, sessionID string, msg protocol.Message) (adapter.DeliveryResult, error) {
+	f.woken = append(f.woken, msg)
+	return adapter.DeliveryResult{
+		Status: protocol.ReceiptHandled,
+		Detail: "recipient woken to act on the message",
 	}, nil
 }
 

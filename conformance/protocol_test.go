@@ -231,8 +231,18 @@ func Test08_CrashAfterAcceptancePreservesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("command did not survive restart: %v", err)
 	}
-	if cmd.State != protocol.CommandSettled {
-		t.Errorf("recovered command state = %q, want settled", cmd.State)
+	// The command was admitted but the host crashed before it settled, so
+	// the durable record must show an unresolved state rather than a
+	// successful one. Reporting it as settled would claim an outcome that
+	// was never established.
+	if cmd.State == protocol.CommandSettled {
+		t.Errorf("recovered command state = %q, want an unresolved state", cmd.State)
+	}
+	if cmd.State != protocol.CommandExecuting && cmd.State != protocol.CommandAccepted {
+		t.Errorf("recovered command state = %q, want accepted or executing", cmd.State)
+	}
+	if cmd.MessageID != res.MessageID {
+		t.Errorf("recovered command message id = %q, want %q", cmd.MessageID, res.MessageID)
 	}
 }
 

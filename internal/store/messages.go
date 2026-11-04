@@ -184,6 +184,35 @@ func (s *Store) ReceiptsFor(ctx context.Context, messageID string) ([]protocol.R
 	return out, rows.Err()
 }
 
+// ReceiptsForSession returns every receipt recorded for a session, oldest
+// first.
+//
+// A subscriber uses this to start from a known point instead of an empty
+// history (ICSP-001 section 7.2).
+func (s *Store) ReceiptsForSession(ctx context.Context, sessionID string) ([]protocol.Receipt, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT message_id, command_id, status, from_session, to_session, detail, observed_at
+		 FROM receipts WHERE to_session = ? OR from_session = ?
+		 ORDER BY receipt_id ASC`, sessionID, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("store: receipts for session: %w", err)
+	}
+	defer rows.Close()
+
+	var out []protocol.Receipt
+	for rows.Next() {
+		var r protocol.Receipt
+		var observedAt scanTime
+		if err := rows.Scan(&r.MessageID, &r.CommandID, &r.Status, &r.From, &r.To,
+			&r.Detail, &observedAt); err != nil {
+			return nil, fmt.Errorf("store: scan session receipt: %w", err)
+		}
+		r.ObservedAt = observedAt.Time()
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // LatestReceipt returns the most recent receipt for a message.
 func (s *Store) LatestReceipt(ctx context.Context, messageID string) (protocol.Receipt, error) {
 	var r protocol.Receipt

@@ -317,11 +317,16 @@ func Test_TransportCarriesJSONRPC(t *testing.T) {
 	}
 	defer ln.Close()
 
-	srv := transport.NewServer(func(ctx context.Context, peer transport.PeerIdentity, method string, params json.RawMessage) (any, *protocol.RPCError) {
+	var srv *transport.Server
+	srv = transport.NewServer(func(ctx context.Context, peer transport.PeerIdentity, conn transport.Conn, method string, params json.RawMessage) (any, *protocol.RPCError) {
 		if !peer.Authenticated {
 			return nil, protocol.Errorf(protocol.CodeUnauthorized, "peer identity was not established")
 		}
-		return acp.NewServer(e.node, e.node.PrincipalID(), e.aliceID).Handle(ctx, method, params)
+		ext := acp.NewServer(e.node, e.node.PrincipalID(), e.aliceID)
+		ext.SetEmitter(func(ctx context.Context, method string, params any) {
+			srv.Notify(conn, method, params)
+		})
+		return ext.Handle(ctx, method, params)
 	})
 	defer srv.Close()
 

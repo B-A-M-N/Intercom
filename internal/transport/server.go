@@ -14,16 +14,31 @@ import (
 // Handler answers a JSON-RPC request.
 //
 // The handler receives the authenticated peer identity so that a sender
-// identity is never taken from the request payload.
-type Handler func(ctx context.Context, peer PeerIdentity, method string, params json.RawMessage) (any, *protocol.RPCError)
+// identity is never taken from the request payload. The connection is
+// passed so the handler can emit server-initiated notifications to the
+// same client.
+type Handler func(ctx context.Context, peer PeerIdentity, conn Conn, method string, params json.RawMessage) (any, *protocol.RPCError)
+
+// Notifier sends a server-initiated notification to a connected client.
+//
+// The transport owns the connection, so notifications are delivered through
+// it rather than through the handler.
+type Notifier func(ctx context.Context, method string, params any)
 
 // Server serves JSON-RPC over a transport.
 type Server struct {
-	handler Handler
-	mu      sync.Mutex
-	conns   map[Conn]struct{}
-	closed  bool
+	handler  Handler
+	notifier Notifier
+	mu       sync.Mutex
+	conns    map[Conn]struct{}
+	closed   bool
 }
+
+// SetNotifier installs the function used to broadcast notifications.
+//
+// The notifier is invoked with the connection that issued the subscribe
+// request, so a subscription only reaches the client that asked for it.
+func (s *Server) SetNotifier(n Notifier) { s.notifier = n }
 
 // NewServer creates a JSON-RPC server.
 func NewServer(h Handler) *Server {
@@ -86,7 +101,7 @@ func (s *Server) dispatch(ctx context.Context, conn Conn, peer PeerIdentity, fra
 
 	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
 
-	result, rpcErr := s.handler(ctx, peer, req.Method, req.Params)
+	result, rpcErr := s.handler(ctx, peer, conn, req.Method, req.Params)
 	if isNotification {
 		return
 	}
@@ -139,6 +154,22 @@ func writeResult(conn Conn, id json.RawMessage, result any) {
 	}
 	resp := protocol.RPCResponse{JSONRPC: "2.0", ID: id, Result: payload}
 	b, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	_, _ = conn.Write(append(b, '\n'))
+}
+
+// Notify sends a server-initiated notification to one connection.
+//
+// Notifications have no id, so a client never replies to them.
+func (s *Server) Notify(conn Conn, method string, params any) {
+	payload, err := json.Marshal(params)
+	if err != nil {
+		return
+	}
+	msg := protocol.RPCNotification{JSONRPC: "2.0", Method: method, Params: payload}
+	b, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
