@@ -22,6 +22,21 @@ func (n *Node) SessionState(ctx context.Context, sessionID string) (protocol.Sna
 		return protocol.Snapshot{}, err
 	}
 
+	// A live adapter is the authority for the session's state, so the
+	// recorded state is refreshed from the harness before it is reported.
+	// The refresh marks the state as native, which distinguishes it from a
+	// state the adapter inferred (ICSP-001 section 7.3).
+	if ad, ok := n.Adapter(sessionID); ok {
+		state, err := ad.State(ctx, sessionID)
+		if err == nil && state.State != "" && state.State.Valid() {
+			if err := n.store.SetSessionState(ctx, sessionID, state.State, store.StateSourceNative); err != nil {
+				return protocol.Snapshot{}, err
+			}
+			rec.State = state.State
+			rec.StateSource = store.StateSourceNative
+		}
+	}
+
 	seq, err := n.store.LatestSequence(ctx, sessionID)
 	if err != nil {
 		return protocol.Snapshot{}, err
@@ -37,12 +52,13 @@ func (n *Node) SessionState(ctx context.Context, sessionID string) (protocol.Sna
 	}
 
 	return protocol.Snapshot{
-		SessionID: sessionID,
-		State:     rec.State,
-		Sequence:  seq,
-		UpdatedAt: rec.LastSeen,
-		Pending:   pending,
-		Recovery:  string(recovery),
+		SessionID:   sessionID,
+		State:       rec.State,
+		StateSource: string(rec.StateSource),
+		Sequence:    seq,
+		UpdatedAt:   rec.LastSeen,
+		Pending:     pending,
+		Recovery:    string(recovery),
 	}, nil
 }
 
@@ -62,9 +78,8 @@ func (n *Node) classifyRecovery(ctx context.Context, sessionID string) (protocol
 
 	// A live adapter reporting a state means the native harness is the
 	// authority for that state.
-	if ad, ok := n.Adapter(sessionID); ok {
-		state, err := ad.State(ctx, sessionID)
-		if err == nil && state.State != "" {
+	if _, ok := n.Adapter(sessionID); ok {
+		if rec.StateSource == store.StateSourceNative {
 			return protocol.RecoveryClean, nil
 		}
 	}
@@ -106,11 +121,15 @@ func (n *Node) Replay(ctx context.Context, sessionID string, afterCursor uint64,
 }
 
 // SetSessionState updates a session's state and journals the change.
-func (n *Node) SetSessionState(ctx context.Context, sessionID string, state protocol.SessionState) error {
+//
+// The source records whether the harness reported the state or the adapter
+// inferred it, so a reader can tell a native state from an inferred one
+// (ICSP-001 section 7.3).
+func (n *Node) SetSessionState(ctx context.Context, sessionID string, state protocol.SessionState, source store.StateSource) error {
 	if !state.Valid() {
 		return protocol.Errorf(protocol.CodeInvalidParams, "invalid session state %q", state)
 	}
-	if err := n.store.SetSessionState(ctx, sessionID, state); err != nil {
+	if err := n.store.SetSessionState(ctx, sessionID, state, source); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", sessionID)
 		}

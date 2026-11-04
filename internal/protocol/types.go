@@ -413,10 +413,13 @@ type PeerInfo struct {
 type Snapshot struct {
 	SessionID string       `json:"sessionId"`
 	State     SessionState `json:"state"`
-	Sequence  uint64       `json:"sequence"`
-	UpdatedAt time.Time    `json:"updatedAt"`
-	Pending   int          `json:"pendingMessages"`
-	Recovery  string       `json:"recovery"`
+	// StateSource records whether the state was reported by the harness
+	// itself or inferred by the adapter (ICSP-001 section 7.3).
+	StateSource string    `json:"stateSource,omitempty"`
+	Sequence    uint64    `json:"sequence"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+	Pending     int       `json:"pendingMessages"`
+	Recovery    string    `json:"recovery"`
 }
 
 // RecoveryClassification describes how a session's state was reconstructed

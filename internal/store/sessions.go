@@ -40,17 +40,19 @@ func (s *Store) RegisterSession(ctx context.Context, peer protocol.PeerInfo) err
 				peer.InstanceID, peer.HostID, peer.PrincipalID, peer.Alias, peer.Harness,
 				peer.HarnessVersion, peer.Presence, string(caps), string(modes),
 				now, now, peer.SessionID)
+
 			if err != nil {
 				return fmt.Errorf("store: update session: %w", err)
 			}
 		case errors.Is(err, sql.ErrNoRows):
 			_, err = tx.ExecContext(ctx,
 				`INSERT INTO sessions (session_id, instance_id, host_id, principal_id, alias, harness,
-				        harness_version, state, presence, capabilities, delivery_modes, created_at, updated_at, last_seen)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				        harness_version, state, state_source, presence, capabilities, delivery_modes,
+				        created_at, updated_at, last_seen)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				peer.SessionID, peer.InstanceID, peer.HostID, peer.PrincipalID, peer.Alias,
-				peer.Harness, peer.HarnessVersion, protocol.SessionIdle, peer.Presence,
-				string(caps), string(modes), now, now, now)
+				peer.Harness, peer.HarnessVersion, protocol.SessionIdle, string(StateSourceInferred),
+				peer.Presence, string(caps), string(modes), now, now, now)
 			if err != nil {
 				return fmt.Errorf("store: insert session: %w", err)
 			}
@@ -61,10 +63,29 @@ func (s *Store) RegisterSession(ctx context.Context, peer protocol.PeerInfo) err
 	})
 }
 
+// StateSource records where a session's state came from.
+//
+// Section 7.3 requires adapters to distinguish native session state from
+// observations inferred by the adapter, so the source is stored alongside
+// the state rather than being lost.
+type StateSource string
+
+const (
+	// StateSourceNative means the harness reported the state itself.
+	StateSourceNative StateSource = "native"
+	// StateSourceInferred means the adapter inferred the state.
+	StateSourceInferred StateSource = "inferred"
+	// StateSourceUnknown means the origin of the state is not established.
+	StateSourceUnknown StateSource = "unknown"
+)
+
 // PeerRecord is one registered session with its resolved metadata.
 type PeerRecord struct {
 	protocol.PeerInfo
 	HarnessVersion string
+	// StateSource records whether the state was reported by the harness or
+	// inferred by the adapter.
+	StateSource StateSource
 }
 
 // GetSession loads one session's peer record.
@@ -75,10 +96,11 @@ func (s *Store) GetSession(ctx context.Context, sessionID string) (PeerRecord, e
 
 	row := s.db.QueryRowContext(ctx,
 		`SELECT session_id, instance_id, host_id, principal_id, alias, harness, harness_version,
-		        state, presence, capabilities, delivery_modes, created_at, updated_at, last_seen
+		        state, state_source, presence, capabilities, delivery_modes, created_at, updated_at, last_seen
 		 FROM sessions WHERE session_id = ?`, sessionID)
+	var stateSource string
 	err := row.Scan(&rec.SessionID, &rec.InstanceID, &rec.HostID, &rec.PrincipalID, &rec.Alias,
-		&rec.Harness, &rec.HarnessVersion, &state, &rec.Presence, &caps, &modes,
+		&rec.Harness, &rec.HarnessVersion, &state, &stateSource, &rec.Presence, &caps, &modes,
 		&created, &updated, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PeerRecord{}, ErrNotFound
@@ -93,6 +115,10 @@ func (s *Store) GetSession(ctx context.Context, sessionID string) (PeerRecord, e
 		return PeerRecord{}, fmt.Errorf("store: decode delivery modes: %w", err)
 	}
 	rec.State = protocol.SessionState(state)
+	rec.StateSource = StateSource(stateSource)
+	if rec.StateSource == "" {
+		rec.StateSource = StateSourceUnknown
+	}
 	return rec, nil
 }
 
@@ -107,7 +133,7 @@ func (s *Store) ListPeers(ctx context.Context, principalID string, limit int) ([
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT session_id, instance_id, host_id, principal_id, alias, harness, harness_version,
-		        state, presence, capabilities, delivery_modes, created_at, updated_at, last_seen
+		        state, state_source, presence, capabilities, delivery_modes, created_at, updated_at, last_seen
 		 FROM sessions WHERE principal_id = ? ORDER BY session_id ASC LIMIT ?`, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: list peers: %w", err)
@@ -117,12 +143,16 @@ func (s *Store) ListPeers(ctx context.Context, principalID string, limit int) ([
 	var out []PeerRecord
 	for rows.Next() {
 		var rec PeerRecord
-		var caps, modes, state string
+		var caps, modes, state, stateSource string
 		var created, updated, lastSeen string
 		if err := rows.Scan(&rec.SessionID, &rec.InstanceID, &rec.HostID, &rec.PrincipalID,
-			&rec.Alias, &rec.Harness, &rec.HarnessVersion, &state, &rec.Presence,
+			&rec.Alias, &rec.Harness, &rec.HarnessVersion, &state, &stateSource, &rec.Presence,
 			&caps, &modes, &created, &updated, &lastSeen); err != nil {
 			return nil, fmt.Errorf("store: scan peer: %w", err)
+		}
+		rec.StateSource = StateSource(stateSource)
+		if rec.StateSource == "" {
+			rec.StateSource = StateSourceUnknown
 		}
 		if err := json.Unmarshal([]byte(caps), &rec.Capabilities); err != nil {
 			return nil, fmt.Errorf("store: decode capabilities: %w", err)
@@ -162,14 +192,20 @@ func (s *Store) ResolveSession(ctx context.Context, aliasOrID string) (PeerRecor
 }
 
 // SetSessionState updates a session's normalized state.
-func (s *Store) SetSessionState(ctx context.Context, sessionID string, state protocol.SessionState) error {
+//
+// The source records whether the harness reported the state or the adapter
+// inferred it (ICSP-001 section 7.3).
+func (s *Store) SetSessionState(ctx context.Context, sessionID string, state protocol.SessionState, source StateSource) error {
 	if !state.Valid() {
 		return fmt.Errorf("store: invalid session state %q", state)
 	}
+	if source == "" {
+		source = StateSourceUnknown
+	}
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE sessions SET state = ?, updated_at = ? WHERE session_id = ?`,
-			state, time.Now().UTC().Format(TimestampLayout), sessionID)
+			`UPDATE sessions SET state = ?, state_source = ?, updated_at = ? WHERE session_id = ?`,
+			state, source, time.Now().UTC().Format(TimestampLayout), sessionID)
 		if err != nil {
 			return fmt.Errorf("store: set session state: %w", err)
 		}

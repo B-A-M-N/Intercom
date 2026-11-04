@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     harness       TEXT NOT NULL DEFAULT '',
     harness_version TEXT NOT NULL DEFAULT '',
     state         TEXT NOT NULL,
+    -- state_source records whether the state came from the harness itself
+    -- or was inferred by the adapter. Section 7.3 requires adapters to
+    -- distinguish native session state from adapter-inferred observations.
+    state_source  TEXT NOT NULL DEFAULT 'inferred',
     presence      TEXT NOT NULL DEFAULT 'unknown',
     capabilities  TEXT NOT NULL DEFAULT '[]',
     delivery_modes TEXT NOT NULL DEFAULT '[]',

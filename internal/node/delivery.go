@@ -322,6 +322,19 @@ func (n *Node) deliver(ctx context.Context, msg protocol.Message, requested prot
 		return
 	}
 
+	// A recipient MUST deduplicate a previously delivered message id
+	// (ICSP-001 section 5.5). A message that already reached the adapter
+	// is not delivered again.
+	alreadyDelivered, err := n.store.MessageDelivered(ctx, msg.MessageID)
+	if err != nil {
+		return
+	}
+	if alreadyDelivered {
+		n.recordReceipt(ctx, msg, protocol.ReceiptDelivered,
+			"the recipient already delivered this message id; delivery was not repeated")
+		return
+	}
+
 	ad, ok := n.Adapter(msg.To)
 	if !ok {
 		// The recipient has no live adapter. The durable inbox still holds
@@ -494,6 +507,14 @@ func (n *Node) applyWake(ctx context.Context, ad adapter.Adapter, msg protocol.M
 		return
 	}
 	n.recordReceipt(ctx, msg, res.Status, res.Detail)
+}
+
+// Redeiver attempts delivery of an already-stored message again.
+//
+// It exists so that the deduplication guarantee can be exercised: a
+// message that already reached the recipient must not be delivered twice.
+func (n *Node) Redeiver(ctx context.Context, msg protocol.Message) {
+	n.deliver(ctx, msg, msg.Delivery)
 }
 
 // capabilityMatrix derives a delivery capability matrix from an adapter.

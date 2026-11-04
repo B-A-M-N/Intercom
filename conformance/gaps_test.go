@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bamn/intercom/internal/adapter"
 	"github.com/bamn/intercom/internal/config"
 	"github.com/bamn/intercom/internal/node"
 	"github.com/bamn/intercom/internal/protocol"
@@ -503,5 +504,107 @@ func Test_NotificationIsNotWrapped(t *testing.T) {
 	}
 	if e.bob.notified[0].Body.Type != "text" {
 		t.Errorf("notified body type = %q, want text", e.bob.notified[0].Body.Type)
+	}
+}
+
+// Test_RecipientDeduplicatesMessageID covers the deduplication requirement
+// of spec section 5.5.
+//
+// A recipient MUST deduplicate a previously delivered message id.
+func Test_RecipientDeduplicatesMessageID(t *testing.T) {
+	e := newEnv(t)
+
+	res, err := e.send(e.aliceSender(), e.bobID, "once", "cmd_dedup000000000000000000001", protocol.DeliveryNotify)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.notified) == 1 })
+	if !ok {
+		t.Fatal("the recipient was not notified")
+	}
+
+	// The same message id is delivered again. The recipient must not see
+	// it twice.
+	duplicated, err := e.store.GetMessage(e.ctx, res.MessageID)
+	if err != nil {
+		t.Fatalf("get message: %v", err)
+	}
+	e.node.Redeiver(e.ctx, duplicated)
+
+	time.Sleep(150 * time.Millisecond)
+	if len(e.bob.notified) != 1 {
+		t.Errorf("the recipient saw %d notifications, want 1", len(e.bob.notified))
+	}
+
+	// The dedup decision is on the receipt trail, so it is observable.
+	receipts, err := e.node.Receipts(e.ctx, res.MessageID)
+	if err != nil {
+		t.Fatalf("receipts: %v", err)
+	}
+	found := false
+	for _, r := range receipts {
+		if len(r.Detail) > 0 && contains(r.Detail, "not repeated") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the deduplication was not reported on the receipt trail: %+v", receipts)
+	}
+}
+
+// Test_SessionStateDistinguishesNativeFromInferred covers the state-source
+// requirement of spec section 7.3.
+//
+// Adapters MUST distinguish native session state from observations inferred
+// by the adapter.
+func Test_SessionStateDistinguishesNativeFromInferred(t *testing.T) {
+	e := newEnv(t)
+
+	// A registered session has not reported a state yet, so its state is
+	// inferred rather than native.
+	rec, err := e.store.GetSession(e.ctx, e.bobID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if rec.StateSource != store.StateSourceInferred {
+		t.Errorf("a session with no harness report has state source %q, want inferred", rec.StateSource)
+	}
+
+	// The live adapter reports idle, which makes the state native.
+	e.bob.state = adapter.SessionState{State: protocol.SessionIdle, SafePoint: true}
+
+	snap, err := e.node.SessionState(e.ctx, e.bobID)
+	if err != nil {
+		t.Fatalf("session state: %v", err)
+	}
+	if snap.State != protocol.SessionIdle {
+		t.Errorf("state = %q, want idle", snap.State)
+	}
+	if snap.StateSource != string(store.StateSourceNative) {
+		t.Errorf("state source = %q, want native", snap.StateSource)
+	}
+
+	// A host disconnect alone does not terminate the logical session. The
+	// session keeps its recorded state, and its presence becomes
+	// disconnected, which is a statement about the transport rather than
+	// about the session's existence.
+	if err := e.node.UnregisterSession(e.ctx, e.bobID); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+	snap, err = e.node.SessionState(e.ctx, e.bobID)
+	if err != nil {
+		t.Fatalf("session state: %v", err)
+	}
+	if snap.State != protocol.SessionIdle {
+		t.Errorf("a disconnect changed the recorded state to %q", snap.State)
+	}
+
+	presence, err := e.node.Presence(e.ctx, e.bobID)
+	if err != nil {
+		t.Fatalf("presence: %v", err)
+	}
+	if presence != protocol.PresenceDisconnected {
+		t.Errorf("presence after disconnect = %q, want disconnected", presence)
 	}
 }

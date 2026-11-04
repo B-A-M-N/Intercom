@@ -403,8 +403,11 @@ type SessionStateParams struct {
 type SessionStateResult struct {
 	SessionID string                `json:"sessionId"`
 	State     protocol.SessionState `json:"state"`
-	Recovery  string                `json:"recovery"`
-	Sequence  uint64                `json:"sequence"`
+	// StateSource records whether the state came from the harness itself or
+	// was inferred by the adapter (ICSP-001 section 7.3).
+	StateSource string `json:"stateSource,omitempty"`
+	Recovery    string `json:"recovery"`
+	Sequence    uint64 `json:"sequence"`
 }
 
 // sessionState queries a session's state and recovery classification.
@@ -418,10 +421,11 @@ func (s *Server) sessionState(ctx context.Context, params json.RawMessage) (any,
 		return nil, toRPCError(err)
 	}
 	return SessionStateResult{
-		SessionID: snap.SessionID,
-		State:     snap.State,
-		Recovery:  snap.Recovery,
-		Sequence:  snap.Sequence,
+		SessionID:   snap.SessionID,
+		State:       snap.State,
+		StateSource: snap.StateSource,
+		Recovery:    snap.Recovery,
+		Sequence:    snap.Sequence,
 	}, nil
 }
 

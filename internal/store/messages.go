@@ -125,6 +125,27 @@ func (s *Store) MessageExists(ctx context.Context, messageID string) (bool, erro
 	return true, nil
 }
 
+// MessageDelivered reports whether a message id already reached a
+// recipient.
+//
+// A recipient MUST deduplicate a previously delivered message id
+// (ICSP-001 section 5.5). A delivery receipt is the evidence that a
+// message reached the recipient, so the presence of one is the dedup key.
+func (s *Store) MessageDelivered(ctx context.Context, messageID string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM receipts WHERE message_id = ? AND status IN (?, ?, ?)`,
+		messageID, protocol.ReceiptDelivered, protocol.ReceiptPresented, protocol.ReceiptInjected).
+		Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: message delivered: %w", err)
+	}
+	return true, nil
+}
+
 // SetInboxState records the durable inbox acceptance state for a message.
 func (s *Store) SetInboxState(ctx context.Context, messageID string, state InboxState) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
