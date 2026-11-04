@@ -126,14 +126,21 @@ func (n *Node) ListPermissions(ctx context.Context, peerSession string) ([]Permi
 // holdsOwnerAuthority reports whether the actor holds owner authority over a
 // session.
 //
-// The host's own principal is the owner of the sessions it registered. A
-// peer grant never carries owner authority, so a peer cannot grant or
-// revoke access even to sessions it may send to.
+// Authority over a session is per session, not per principal. A session
+// always owns itself. Any authority over a different session comes from an
+// explicit grant, and only an owner-role grant carries owner authority.
+//
+// This is what stops a peer from managing permissions. Two sessions that
+// share a principal are peers for communication purposes, but one of them
+// still cannot reconfigure the other's access: peer communication MUST NOT
+// grant owner authority, and a peer MUST NOT be able to modify another
+// session's permission policy (ICSP-001 section 11.2).
 func (n *Node) holdsOwnerAuthority(ctx context.Context, actor Sender, ownerSession string) (bool, error) {
 	if actor.PrincipalID == "" || actor.SessionID == "" {
 		return false, nil
 	}
-	if actor.PrincipalID == n.principalID {
+	// A session always owns itself.
+	if actor.SessionID == ownerSession {
 		return true, nil
 	}
 	return n.store.CanApprove(ctx, actor.SessionID, ownerSession)

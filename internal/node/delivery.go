@@ -470,9 +470,6 @@ func (n *Node) checkRate(ctx context.Context, peer string) error {
 // The policy narrows what the sender's grant permits; it never widens it.
 // A peer with no explicit policy accepts every mode its grant allows.
 func (n *Node) checkRecipientPolicy(ctx context.Context, from Sender, targetSession string, mode protocol.DeliveryMode) error {
-	if from.PrincipalID == n.principalID {
-		return nil
-	}
 	modes, hasPolicy, err := n.store.DeliveryPolicy(ctx, targetSession, from.SessionID)
 	if err != nil {
 		return err
