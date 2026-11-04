@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/bamn/intercom/internal/protocol"
 )
 
 // Role classifies the authority a peer holds over a session
@@ -135,6 +138,54 @@ func (s *Store) ListPermissions(ctx context.Context, peerSession string) ([]Perm
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// SetDeliveryPolicy sets the delivery modes a recipient accepts from a
+// peer.
+//
+// The receiving session enforces its own policy independently of the
+// sender's authority (ICSP-001 section 11.3). A grant permits a submission;
+// this policy decides what happens to it.
+func (s *Store) SetDeliveryPolicy(ctx context.Context, ownerSession, peerSession string, modes []protocol.DeliveryMode) error {
+	encoded, err := json.Marshal(modes)
+	if err != nil {
+		return fmt.Errorf("store: marshal delivery policy: %w", err)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO delivery_policies (owner_session, peer_session, allowed_modes, updated_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(owner_session, peer_session)
+			 DO UPDATE SET allowed_modes = excluded.allowed_modes, updated_at = excluded.updated_at`,
+			ownerSession, peerSession, string(encoded), time.Now().UTC().Format(TimestampLayout))
+		if err != nil {
+			return fmt.Errorf("store: set delivery policy: %w", err)
+		}
+		return nil
+	})
+}
+
+// DeliveryPolicy returns the delivery modes a recipient accepts from a
+// peer.
+//
+// A peer with no explicit policy accepts every mode its grant allows. The
+// policy narrows what the grant permits; it never widens it.
+func (s *Store) DeliveryPolicy(ctx context.Context, ownerSession, peerSession string) ([]protocol.DeliveryMode, bool, error) {
+	var encoded string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT allowed_modes FROM delivery_policies WHERE owner_session = ? AND peer_session = ?`,
+		ownerSession, peerSession).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: delivery policy: %w", err)
+	}
+	var modes []protocol.DeliveryMode
+	if err := json.Unmarshal([]byte(encoded), &modes); err != nil {
+		return nil, false, fmt.Errorf("store: decode delivery policy: %w", err)
+	}
+	return modes, true, nil
 }
 
 // CanSend reports whether a peer may submit messages to an owner's session.

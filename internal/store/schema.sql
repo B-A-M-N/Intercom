@@ -144,6 +144,19 @@ CREATE TABLE IF NOT EXISTS peer_permissions (
     PRIMARY KEY (peer_session, owner_session)
 );
 
+-- Per-recipient delivery policy (ICSP-001 section 11.1).
+--
+-- The receiving session enforces its own policy independently of the
+-- sender's authority: a grant lets a peer submit, and this table decides
+-- which delivery modes the recipient will accept from that peer.
+CREATE TABLE IF NOT EXISTS delivery_policies (
+    owner_session TEXT NOT NULL,
+    peer_session  TEXT NOT NULL,
+    allowed_modes TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (owner_session, peer_session)
+);
+
 -- Audit records for security-relevant transitions (ICSP-001 section 11.1).
 CREATE TABLE IF NOT EXISTS audit_log (
     audit_id      INTEGER PRIMARY KEY AUTOINCREMENT,

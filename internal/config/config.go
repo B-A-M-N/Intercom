@@ -33,6 +33,12 @@ type Limits struct {
 	MessageRetention time.Duration `json:"messageRetention"`
 	// EventRetention bounds how long journal events are retained.
 	EventRetention time.Duration `json:"eventRetention"`
+	// DeduplicationHorizon is how long a command id stays deduplicable.
+	//
+	// Retention and compaction must preserve the idempotency obligations
+	// for this horizon, so a message is never purged while its command
+	// could still be retried (ICSP-001 section 13).
+	DeduplicationHorizon time.Duration `json:"deduplicationHorizon"`
 	// MaxDatabaseBytes bounds the durable store size, 0 meaning unbounded.
 	MaxDatabaseBytes int64 `json:"maxDatabaseBytes"`
 }
@@ -48,6 +54,7 @@ func DefaultLimits() Limits {
 		PerPeerRatePerMinute:     600,
 		MessageRetention:         7 * 24 * time.Hour,
 		EventRetention:           30 * 24 * time.Hour,
+		DeduplicationHorizon:     24 * time.Hour,
 		MaxDatabaseBytes:         1 << 30, // 1 GiB
 	}
 }

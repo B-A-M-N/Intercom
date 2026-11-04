@@ -134,6 +134,13 @@ func (n *Node) Send(ctx context.Context, from Sender, req SendRequest) (SendResu
 		return SendResult{}, err
 	}
 
+	// The receiving session enforces its own policy independently of the
+	// sender's authority (ICSP-001 section 11.3). A grant permits the
+	// submission; the recipient's policy decides which modes it accepts.
+	if err := n.checkRecipientPolicy(ctx, from, target.SessionID, req.Delivery.Mode); err != nil {
+		return SendResult{}, err
+	}
+
 	// Enforce the recipient inbox bound.
 	pending, err := n.store.CountPendingInbox(ctx, target.SessionID)
 	if err != nil {
@@ -456,6 +463,30 @@ func (n *Node) checkRate(ctx context.Context, peer string) error {
 	}
 	n.rateSeen[peer] = append(kept, now)
 	return nil
+}
+
+// checkRecipientPolicy applies the recipient's delivery policy.
+//
+// The policy narrows what the sender's grant permits; it never widens it.
+// A peer with no explicit policy accepts every mode its grant allows.
+func (n *Node) checkRecipientPolicy(ctx context.Context, from Sender, targetSession string, mode protocol.DeliveryMode) error {
+	if from.PrincipalID == n.principalID {
+		return nil
+	}
+	modes, hasPolicy, err := n.store.DeliveryPolicy(ctx, targetSession, from.SessionID)
+	if err != nil {
+		return err
+	}
+	if !hasPolicy {
+		return nil
+	}
+	for _, allowed := range modes {
+		if allowed == mode {
+			return nil
+		}
+	}
+	return protocol.Errorf(protocol.CodeForbidden,
+		"the recipient session does not accept %q delivery from this peer", mode)
 }
 
 // authorizeSend checks that a sender may send to a session.

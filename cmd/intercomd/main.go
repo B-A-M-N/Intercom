@@ -128,6 +128,7 @@ func run() error {
 		})
 		return ext.Handle(ctx, method, params)
 	})
+	srv.SetMaxConnections(cfg.Limits.MaxConcurrentConnections)
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -137,6 +138,15 @@ func run() error {
 		<-ctx.Done()
 		srv.Close()
 		ln.Close()
+	}()
+
+	// Retention keeps the durable store bounded. It runs alongside the
+	// listener rather than only at startup, so a long-lived host does not
+	// accumulate messages and journal events without limit.
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		n.StartMaintenance(ctx, n.MaintenanceInterval())
 	}()
 
 	fmt.Fprintf(os.Stderr, "intercomd: listening on %s (host %s)\n", cfg.SocketPath, n.HostID())
@@ -157,12 +167,19 @@ func run() error {
 		go func() {
 			defer wg.Done()
 			if err := srv.Serve(ctx, conn); err != nil && ctx.Err() == nil {
+				// A refused connection is explicit backpressure, not a
+				// silent drop (ICSP-001 section 10.4).
+				if errors.Is(err, transport.ErrTooManyConnections) {
+					fmt.Fprintf(os.Stderr, "intercomd: refused connection: %v\n", err)
+					return
+				}
 				fmt.Fprintf(os.Stderr, "intercomd: connection: %v\n", err)
 			}
 		}()
 	}
 
 	wg.Wait()
+	<-maintenanceDone
 	return nil
 }
 

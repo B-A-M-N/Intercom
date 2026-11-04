@@ -184,6 +184,92 @@ func (s *Store) CompactEvents(ctx context.Context, sessionID string, before uint
 	return removed, err
 }
 
+// CompactSessionsBefore compacts every session's journal before the cutoff
+// sequence, returning the number of events removed.
+//
+// The compaction floor is recorded per session, so a later replay reports a
+// cursor gap rather than silently omitting history.
+func (s *Store) CompactSessionsBefore(ctx context.Context, before uint64) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT session_id FROM session_events`)
+	if err != nil {
+		return 0, fmt.Errorf("store: list sessions for compaction: %w", err)
+	}
+	var sessions []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("store: scan session for compaction: %w", err)
+		}
+		sessions = append(sessions, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, id := range sessions {
+		n, err := s.CompactEvents(ctx, id, before)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// CompactSessionsOlderThan compacts journal events older than the cutoff,
+// returning the number of events removed.
+//
+// Compaction is by age rather than by sequence, because a sequence cutoff
+// would need to know how many events each session has. The compaction floor
+// is recorded per session so a later replay reports a cursor gap rather
+// than silently omitting history.
+func (s *Store) CompactSessionsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	mark := cutoff.UTC().Format(TimestampLayout)
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT session_id FROM session_events WHERE timestamp < ?`, mark)
+	if err != nil {
+		return 0, fmt.Errorf("store: list sessions for compaction: %w", err)
+	}
+	var sessions []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("store: scan session for compaction: %w", err)
+		}
+		sessions = append(sessions, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, id := range sessions {
+		// Compact everything strictly older than the oldest retained
+		// event in this session, so the retained window is contiguous.
+		var oldest sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT MIN(sequence) FROM session_events WHERE session_id = ? AND timestamp >= ?`,
+			id, mark).Scan(&oldest); err != nil {
+			return total, fmt.Errorf("store: oldest retained event: %w", err)
+		}
+		if !oldest.Valid {
+			continue
+		}
+		n, err := s.CompactEvents(ctx, id, uint64(oldest.Int64))
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // compactionFloor returns the highest sequence compacted away for a session.
 func (s *Store) compactionFloor(ctx context.Context, sessionID string) (uint64, error) {
 	var floor uint64

@@ -284,6 +284,36 @@ func (s *Store) CountPendingInbox(ctx context.Context, sessionID string) (int, e
 	return n, nil
 }
 
+// PurgeMessagesOlderThan deletes messages and their receipts older than the
+// cutoff, returning the number of messages removed.
+//
+// Retention MUST preserve the idempotency obligations for the advertised
+// deduplication horizon (ICSP-001 section 13), so the caller chooses a
+// cutoff at or beyond that horizon.
+func (s *Store) PurgeMessagesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	mark := cutoff.UTC().Format(TimestampLayout)
+	var removed int64
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM receipts WHERE message_id IN (
+				SELECT message_id FROM messages WHERE created_at < ? AND expires_at = ''
+			)`, mark)
+		if err != nil {
+			return fmt.Errorf("store: purge receipts: %w", err)
+		}
+		_ = res
+
+		res, err = tx.ExecContext(ctx,
+			`DELETE FROM messages WHERE created_at < ? AND expires_at = ''`, mark)
+		if err != nil {
+			return fmt.Errorf("store: purge messages: %w", err)
+		}
+		removed, _ = res.RowsAffected()
+		return nil
+	})
+	return removed, err
+}
+
 // ExpiredMessages returns messages whose expiry deadline has passed.
 func (s *Store) ExpiredMessages(ctx context.Context, now time.Time, limit int) ([]string, error) {
 	if limit <= 0 {

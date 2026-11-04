@@ -32,7 +32,30 @@ type Server struct {
 	mu       sync.Mutex
 	conns    map[Conn]struct{}
 	closed   bool
+	// maxConns bounds the simultaneously served connections. Zero means
+	// unbounded, which is not the default: the host sets a conservative
+	// limit (ICSP-001 section 10.4).
+	maxConns int
 }
+
+// SetMaxConnections bounds the simultaneously served connections.
+//
+// Exhaustion results in an explicit refusal rather than unbounded growth.
+func (s *Server) SetMaxConnections(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxConns = n
+}
+
+// ConnCount reports the number of connections currently being served.
+func (s *Server) ConnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
+// ErrTooManyConnections is returned when the connection bound is reached.
+var ErrTooManyConnections = errors.New("transport: too many connections")
 
 // SetNotifier installs the function used to broadcast notifications.
 //
@@ -53,6 +76,11 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
+	}
+	if s.maxConns > 0 && len(s.conns) >= s.maxConns {
+		s.mu.Unlock()
+		conn.Close()
+		return ErrTooManyConnections
 	}
 	s.conns[conn] = struct{}{}
 	s.mu.Unlock()

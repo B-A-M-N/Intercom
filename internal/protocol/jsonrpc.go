@@ -131,6 +131,9 @@ const (
 	MethodSessionRegister    = "_intercom/session/register"
 	MethodMessageListPending = "_intercom/message/listPending"
 	MethodMessageReport      = "_intercom/message/report"
+	MethodPermissionGrant    = "_intercom/permission/grant"
+	MethodPermissionRevoke   = "_intercom/permission/revoke"
+	MethodPermissionList     = "_intercom/permission/list"
 )
 
 // IntercomMethodPrefix identifies methods belonging to the Intercom extension.

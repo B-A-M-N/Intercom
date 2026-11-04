@@ -19,6 +19,7 @@ import (
 
 	"github.com/bamn/intercom/internal/node"
 	"github.com/bamn/intercom/internal/protocol"
+	"github.com/bamn/intercom/internal/store"
 )
 
 // ProtocolVersion is the ACP protocol version this extension targets.
@@ -157,6 +158,12 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		return s.messageListPending(ctx, params)
 	case protocol.MethodMessageReport:
 		return s.messageReport(ctx, params)
+	case protocol.MethodPermissionGrant:
+		return s.permissionGrant(ctx, params)
+	case protocol.MethodPermissionRevoke:
+		return s.permissionRevoke(ctx, params)
+	case protocol.MethodPermissionList:
+		return s.permissionList(ctx, params)
 	default:
 		if protocol.IsIntercomMethod(method) {
 			return nil, protocol.Errorf(protocol.CodeMethodNotFound, "unknown Intercom method %q", method)
@@ -655,6 +662,91 @@ func (s *Server) messageReport(ctx context.Context, params json.RawMessage) (any
 		return nil, toRPCError(err)
 	}
 	return messageReportResult{MessageID: p.MessageID, Status: p.Status}, nil
+}
+
+// PermissionGrantParams are the parameters of _intercom/permission/grant.
+type PermissionGrantParams struct {
+	OwnerSession string `json:"ownerSession"`
+	PeerSession  string `json:"peerSession"`
+	Role         string `json:"role"`
+}
+
+// PermissionResult is the response to a permission mutation.
+type PermissionResult struct {
+	OwnerSession string `json:"ownerSession"`
+	PeerSession  string `json:"peerSession"`
+	Role         string `json:"role,omitempty"`
+	Granted      bool   `json:"granted"`
+}
+
+// permissionGrant grants a peer access to an owner's session.
+//
+// The caller's identity comes from the transport. A peer without owner
+// authority is refused, which is what stops a peer from modifying another
+// session's permission policy.
+func (s *Server) permissionGrant(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p PermissionGrantParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	role := store.Role(p.Role)
+	if role == "" {
+		role = store.RolePeer
+	}
+	if err := s.n.GrantPermission(ctx, s.sender(), p.OwnerSession, p.PeerSession, role); err != nil {
+		return nil, toRPCError(err)
+	}
+	return PermissionResult{
+		OwnerSession: p.OwnerSession,
+		PeerSession:  p.PeerSession,
+		Role:         string(role),
+		Granted:      true,
+	}, nil
+}
+
+// PermissionRevokeParams are the parameters of _intercom/permission/revoke.
+type PermissionRevokeParams struct {
+	OwnerSession string `json:"ownerSession"`
+	PeerSession  string `json:"peerSession"`
+}
+
+// permissionRevoke revokes a peer's access to an owner's session.
+func (s *Server) permissionRevoke(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p PermissionRevokeParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := s.n.RevokePermission(ctx, s.sender(), p.OwnerSession, p.PeerSession); err != nil {
+		return nil, toRPCError(err)
+	}
+	return PermissionResult{
+		OwnerSession: p.OwnerSession,
+		PeerSession:  p.PeerSession,
+		Granted:      false,
+	}, nil
+}
+
+// PermissionListParams are the parameters of _intercom/permission/list.
+type PermissionListParams struct {
+	PeerSession string `json:"peerSession"`
+}
+
+// PermissionListResult is the response to _intercom/permission/list.
+type PermissionListResult struct {
+	Permissions []node.PermissionRecord `json:"permissions"`
+}
+
+// permissionList returns the active grants held by a peer.
+func (s *Server) permissionList(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p PermissionListParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	perms, err := s.n.ListPermissions(ctx, p.PeerSession)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return PermissionListResult{Permissions: perms}, nil
 }
 
 // sender returns the transport-authenticated sender identity.
