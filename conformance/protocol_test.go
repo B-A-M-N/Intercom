@@ -2,12 +2,14 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/bamn/intercom/internal/adapter"
+	"github.com/bamn/intercom/internal/adapter/acp"
 	"github.com/bamn/intercom/internal/config"
 	"github.com/bamn/intercom/internal/ids"
 	"github.com/bamn/intercom/internal/node"
@@ -481,6 +483,59 @@ func Test16_BackpressurePreventsUnboundedGrowth(t *testing.T) {
 	}
 	if rpcErr.Code != protocol.CodeLimitExceeded {
 		t.Errorf("error code = %d, want %d (limit exceeded)", rpcErr.Code, protocol.CodeLimitExceeded)
+	}
+}
+
+// Test17_OrdinaryACPClientOperates covers spec test 17: an ordinary ACP
+// client continues to operate without Intercom support.
+//
+// The client is the reference ACP implementation, driven in
+// adapters/python/tests/test_real_acp_client.py. This test covers the
+// server-side half: an ACP method the extension does not define must be
+// reported as unknown, and the extension must not answer methods it did not
+// claim.
+func Test17_OrdinaryACPClientOperates(t *testing.T) {
+	e := newEnv(t)
+	srv := acp.NewServer(e.node, e.node.PrincipalID(), e.aliceID)
+
+	// A standard ACP method the extension does not implement must be
+	// reported as method-not-found rather than intercepted.
+	_, rpcErr := srv.Handle(e.ctx, "session/new", json.RawMessage(`{"cwd":"/tmp","mcpServers":[]}`))
+	if rpcErr == nil {
+		t.Fatal("the extension answered a standard ACP method it does not implement")
+	}
+	if rpcErr.Code != protocol.CodeMethodNotFound {
+		t.Errorf("error code = %d, want %d (method not found)", rpcErr.Code, protocol.CodeMethodNotFound)
+	}
+
+	// The extension must not answer standard ACP methods by accident.
+	for _, method := range []string{"initialize", "authenticate", "session/cancel"} {
+		switch method {
+		case "initialize":
+			// initialize is implemented by the ACP surface.
+			continue
+		default:
+			_, err := srv.Handle(e.ctx, method, nil)
+			if err == nil {
+				t.Errorf("the extension answered the standard method %q", method)
+			} else if err.Code != protocol.CodeMethodNotFound {
+				t.Errorf("%s error code = %d, want %d", method, err.Code, protocol.CodeMethodNotFound)
+			}
+		}
+	}
+
+	// An ordinary client that ignores _meta is unaffected by the
+	// extension's advertisement.
+	result, err := srv.Handle(e.ctx, "initialize", nil)
+	if err != nil {
+		t.Fatalf("initialize failed: %v", err)
+	}
+	init, ok := result.(acp.InitializeResult)
+	if !ok {
+		t.Fatalf("initialize returned %T", result)
+	}
+	if init.ProtocolVersion != acp.ProtocolVersion {
+		t.Errorf("protocolVersion = %d, want %d", init.ProtocolVersion, acp.ProtocolVersion)
 	}
 }
 
