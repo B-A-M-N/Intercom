@@ -44,6 +44,11 @@ type Node struct {
 	// observers receive delivery events
 	obsMu     sync.RWMutex
 	observers map[string][]chan protocol.Receipt
+
+	// streams serialize delivery within each sender-recipient pair, so
+	// ordering is preserved within one ordered stream.
+	streamMu sync.Mutex
+	streams  map[streamKey]chan protocol.Message
 }
 
 // Options configure a Node.

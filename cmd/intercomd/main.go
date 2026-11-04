@@ -149,6 +149,14 @@ func run() error {
 		n.StartMaintenance(ctx, n.MaintenanceInterval())
 	}()
 
+	// The presence sweep marks peers that stopped reporting as
+	// disconnected. It never ends a session.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		n.StartHeartbeat(ctx, node.HeartbeatInterval)
+	}()
+
 	fmt.Fprintf(os.Stderr, "intercomd: listening on %s (host %s)\n", cfg.SocketPath, n.HostID())
 
 	for {
@@ -180,6 +188,7 @@ func run() error {
 
 	wg.Wait()
 	<-maintenanceDone
+	<-heartbeatDone
 	return nil
 }
 

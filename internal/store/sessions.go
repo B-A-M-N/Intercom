@@ -215,6 +215,25 @@ func (s *Store) MarkAllDisconnected(ctx context.Context, hostID string) (int64, 
 	return n, nil
 }
 
+// MarkStaleDisconnected marks sessions that have not reported liveness
+// since the cutoff as disconnected.
+//
+// Only presence changes. The logical session survives, because a host
+// disconnect alone does not terminate a session (ICSP-001 section 7.3).
+func (s *Store) MarkStaleDisconnected(ctx context.Context, cutoff time.Time) (int64, error) {
+	mark := cutoff.UTC().Format(TimestampLayout)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET presence = ?, updated_at = ?
+		 WHERE presence != ? AND (last_seen = '' OR last_seen < ?)`,
+		protocol.PresenceDisconnected, time.Now().UTC().Format(TimestampLayout),
+		protocol.PresenceDisconnected, mark)
+	if err != nil {
+		return 0, fmt.Errorf("store: mark stale disconnected: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // RecordInstance registers a new agent process incarnation.
 func (s *Store) RecordInstance(ctx context.Context, instanceID, hostID, sessionID, harness, version string, pid int) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {

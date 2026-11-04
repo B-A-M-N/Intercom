@@ -131,6 +131,7 @@ const (
 	MethodSessionRegister    = "_intercom/session/register"
 	MethodMessageListPending = "_intercom/message/listPending"
 	MethodMessageReport      = "_intercom/message/report"
+	MethodHeartbeat          = "_intercom/heartbeat"
 	MethodPermissionGrant    = "_intercom/permission/grant"
 	MethodPermissionRevoke   = "_intercom/permission/revoke"
 	MethodPermissionList     = "_intercom/permission/list"

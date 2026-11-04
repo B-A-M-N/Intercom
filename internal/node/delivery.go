@@ -255,7 +255,13 @@ func (n *Node) Send(ctx context.Context, from Sender, req SendRequest) (SendResu
 
 	// Delivery is attempted after durable admission. A delivery failure does
 	// not undo the admission; it is reported through the receipt trail.
-	go n.deliver(ctx, stored, req.Delivery)
+	//
+	// Deliveries for one sender-recipient stream are serialized so that
+	// ordering is preserved within that stream (ICSP-001 section 5.5).
+	// Streams are independent, so unrelated senders are not ordered against
+	// one another.
+	stream := streamKey{from: from.SessionID, to: target.SessionID}
+	n.dispatch(ctx, stream, stored, req.Delivery)
 
 	return SendResult{
 		CommandID: req.CommandID,
@@ -263,6 +269,48 @@ func (n *Node) Send(ctx context.Context, from Sender, req SendRequest) (SendResu
 		Status:    protocol.ReceiptAccepted,
 		Detail:    "durably admitted",
 	}, nil
+}
+
+// streamKey identifies an ordered sender-recipient stream.
+type streamKey struct {
+	from string
+	to   string
+}
+
+// dispatch delivers a message in stream order.
+//
+// Each stream has its own queue and its own worker, so messages from one
+// sender to one recipient are delivered in submission order, while
+// unrelated streams proceed concurrently.
+func (n *Node) dispatch(ctx context.Context, stream streamKey, msg protocol.Message, requested protocol.Delivery) {
+	n.streamMu.Lock()
+	if n.streams == nil {
+		n.streams = make(map[streamKey]chan protocol.Message)
+	}
+	ch, ok := n.streams[stream]
+	if !ok {
+		ch = make(chan protocol.Message, 1024)
+		n.streams[stream] = ch
+		go n.runStream(ctx, stream, ch)
+	}
+	n.streamMu.Unlock()
+
+	select {
+	case ch <- msg:
+	case <-ctx.Done():
+	}
+}
+
+// runStream delivers the messages of one stream in order.
+func (n *Node) runStream(ctx context.Context, stream streamKey, ch <-chan protocol.Message) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			n.deliver(ctx, msg, msg.Delivery)
+		}
+	}
 }
 
 // deliver attempts delivery and records the resulting receipts.

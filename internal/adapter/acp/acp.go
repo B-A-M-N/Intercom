@@ -158,6 +158,8 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		return s.messageListPending(ctx, params)
 	case protocol.MethodMessageReport:
 		return s.messageReport(ctx, params)
+	case protocol.MethodHeartbeat:
+		return s.heartbeat(ctx, params)
 	case protocol.MethodPermissionGrant:
 		return s.permissionGrant(ctx, params)
 	case protocol.MethodPermissionRevoke:
@@ -662,6 +664,41 @@ func (s *Server) messageReport(ctx context.Context, params json.RawMessage) (any
 		return nil, toRPCError(err)
 	}
 	return messageReportResult{MessageID: p.MessageID, Status: p.Status}, nil
+}
+
+// HeartbeatParams are the parameters of _intercom/heartbeat.
+type HeartbeatParams struct {
+	Session string `json:"sessionId,omitempty"`
+}
+
+// HeartbeatResult is the response to _intercom/heartbeat.
+type HeartbeatResult struct {
+	SessionID string                 `json:"sessionId"`
+	Presence  protocol.PresenceState `json:"presence"`
+}
+
+// heartbeat records that a peer is alive.
+//
+// Presence distinguishes a lost transport from a terminated agent, so a
+// peer that stops reporting becomes disconnected rather than ended
+// (ICSP-001 section 4).
+func (s *Server) heartbeat(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p HeartbeatParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	session := p.Session
+	if session == "" {
+		session = s.peerSession
+	}
+	if err := s.n.Heartbeat(ctx, session); err != nil {
+		return nil, toRPCError(err)
+	}
+	presence, err := s.n.Presence(ctx, session)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return HeartbeatResult{SessionID: session, Presence: presence}, nil
 }
 
 // PermissionGrantParams are the parameters of _intercom/permission/grant.
