@@ -120,7 +120,7 @@ func Test_ACPUnknownMethodIsRejected(t *testing.T) {
 	e := newEnv(t)
 	srv := acp.NewServer(e.node, e.node.PrincipalID(), e.aliceID)
 
-	_, rpcErr := srv.HandleValue(e.ctx, "_intercom/does/not/exist", nil)
+	_, rpcErr := srv.HandleValue(e.ctx, protocol.ExtensionPrefix+"does/not/exist", nil)
 	if rpcErr == nil {
 		t.Fatal("unknown Intercom method was accepted")
 	}

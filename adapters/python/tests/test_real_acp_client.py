@@ -121,7 +121,7 @@ class IntercomClient(Client):
         raise NotImplementedError
 
     async def ext_method(self, method: str, params: dict):
-        """Extension methods reach the agent as _intercom/... on the wire."""
+        """Extension methods reach the agent under the reverse-DNS namespace."""
         return {}
 
 
@@ -146,8 +146,9 @@ async def main():
 
     # The extension is reachable through the reference client's own
     # extension mechanism: ext_method prefixes the method with "_", so
-    # "intercom/hello" becomes "_intercom/hello" on the wire.
-    hello = await conn.ext_method("intercom/hello", {})
+    # "dev.bamn.intercom/hello" becomes "_dev.bamn.intercom/hello" on the
+    # wire.
+    hello = await conn.ext_method("dev.bamn.intercom/hello", {})
     print("HELLO " + json.dumps(hello))
 
     # A standard ACP method that this agent does not implement must fail

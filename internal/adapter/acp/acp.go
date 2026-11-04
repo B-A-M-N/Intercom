@@ -65,10 +65,15 @@ type InitializeResult struct {
 	Meta              map[string]any   `json:"_meta,omitempty"`
 }
 
-// HelloResult is the response to _intercom/hello.
+// HelloResult is the response to the extension's hello method.
 type HelloResult struct {
-	SpecVersion  string                `json:"specVersion"`
-	SpecRevision string                `json:"specRevision"`
+	SpecVersion  string `json:"specVersion"`
+	SpecRevision string `json:"specRevision"`
+	// Namespace is the reverse-DNS namespace this extension is published
+	// under, so a client knows which implementer owns it.
+	Namespace string `json:"namespace"`
+	// Prefix is the underscore-prefixed method prefix.
+	Prefix       string                `json:"prefix"`
 	Capabilities []protocol.Capability `json:"capabilities"`
 	Profiles     []string              `json:"profiles"`
 	Meta         map[string]any        `json:"_meta,omitempty"`
@@ -95,7 +100,8 @@ func (s *Server) initializeResult() InitializeResult {
 			"intercom": map[string]any{
 				"specVersion":  protocol.SpecVersion,
 				"specRevision": protocol.SpecRevision,
-				"namespace":    protocol.IntercomMethodPrefix,
+				"namespace":    protocol.ExtensionNamespace,
+				"prefix":       protocol.ExtensionPrefix,
 			},
 		},
 	}
@@ -179,6 +185,8 @@ func (s *Server) hello() (HelloResult, *protocol.RPCError) {
 	return HelloResult{
 		SpecVersion:  protocol.SpecVersion,
 		SpecRevision: protocol.SpecRevision,
+		Namespace:    protocol.ExtensionNamespace,
+		Prefix:       protocol.ExtensionPrefix,
 		Capabilities: s.n.CapabilityAdvertisement(),
 		Profiles:     s.n.SupportedProfiles(),
 	}, nil

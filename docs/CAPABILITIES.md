@@ -58,6 +58,21 @@ So the Muse adapter records notifications in the adapter host's
 operator-visible surface and reports them as `presented`. It never reports
 `injected`, because nothing was injected into a model's context.
 
+## The extension namespace
+
+The extension is published under `dev.bamn.intercom`, so its methods are
+`_dev.bamn.intercom/hello` and so on.
+
+Section 8.1 requires a collision-resistant reverse-DNS namespace controlled
+by the implementer before a stable extension is published. The
+specification's own examples use the provisional `_intercom/` prefix, which
+is explicitly not a claim of collision resistance.
+
+The namespace is reported by the hello method and advertised through
+`_meta`, so a client can tell which implementer owns the extension. The
+reference ACP client routes any underscore-prefixed method to the
+extension handler, which is why the prefix form is the wire form.
+
 ## Capability identifiers
 
 The identifiers from section 8.3, and what this implementation reports for

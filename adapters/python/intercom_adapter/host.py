@@ -25,6 +25,17 @@ from typing import Any, Optional
 from .client import IntercomClient, IntercomError, wait_for_socket
 from .harness import BaseHarness, DeliveryResult, RECEIPT_UNKNOWN
 
+#: The ACP extension namespace.
+#:
+#: Section 8.1 requires a collision-resistant reverse-DNS namespace
+#: controlled by the implementer to be selected before a stable ACP
+#: extension is published. The specification's examples use the provisional
+#: "_intercom/" prefix; this implementation uses a reverse-DNS namespace.
+EXTENSION_NAMESPACE = "dev.bamn.intercom"
+
+#: The underscore-prefixed method prefix ACP routes to extension handlers.
+EXTENSION_PREFIX = f"_{EXTENSION_NAMESPACE}/"
+
 
 @dataclass
 class HostConfig:
@@ -68,7 +79,7 @@ class AdapterHost:
         new instance id while the session identity is preserved (ICSP-001
         section 3).
         """
-        hello = self.client.call("_intercom/hello")
+        hello = self.client.call(f"{EXTENSION_PREFIX}hello")
 
         payload = {
             "sessionId": self.cfg.session_id,
@@ -82,7 +93,7 @@ class AdapterHost:
         if self.cfg.principal:
             payload["principalId"] = self.cfg.principal
 
-        self.client.call("_intercom/session/register", payload)
+        self.client.call(f"{EXTENSION_PREFIX}session/register", payload)
 
         return {
             "harness": self.harness.identity[0],
@@ -105,7 +116,9 @@ class AdapterHost:
         reports what it did.
         """
         delivered = 0
-        result = self.client.call("_intercom/message/listPending", {"sessionId": self.cfg.session_id})
+        result = self.client.call(
+            f"{EXTENSION_PREFIX}message/listPending", {"sessionId": self.cfg.session_id}
+        )
         for message in result.get("messages", []):
             outcome = self._deliver_one(message)
             self._report(message, outcome)
@@ -136,7 +149,7 @@ class AdapterHost:
         """Report a delivery outcome back to the Go core."""
         try:
             self.client.call(
-                "_intercom/message/report",
+                f"{EXTENSION_PREFIX}message/report",
                 {
                     "messageId": message.get("messageId", ""),
                     "status": outcome.status,

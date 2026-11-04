@@ -105,40 +105,55 @@ func IsNotification(raw json.RawMessage) bool {
 	return len(probe.ID) == 0 || string(probe.ID) == "null"
 }
 
-// Method names for the Intercom ACP extension namespace (ICSP-001 section 8.2).
+// ExtensionNamespace is the ACP extension namespace for this implementation.
 //
-// The namespace is provisional and reverse-DNS style; it must be replaced with
-// a collision-resistant namespace controlled by the implementer before the
-// extension is published as stable.
+// Section 8.1 requires a collision-resistant reverse-DNS namespace
+// controlled by the implementer to be selected before a stable ACP
+// extension is published. The specification's own examples use the
+// provisional "_intercom/" prefix; this implementation uses a reverse-DNS
+// namespace instead, so the published extension cannot collide with
+// another implementer's.
+const ExtensionNamespace = "dev.bamn.intercom"
+
+// ExtensionPrefix is the underscore-prefixed method prefix that ACP uses
+// for extension methods.
+//
+// ACP routes any method beginning with an underscore to the extension
+// handler, and the reference client prefixes extension methods with an
+// underscore on the wire.
+const ExtensionPrefix = "_" + ExtensionNamespace + "/"
+
+// Method names for the Intercom ACP extension namespace (ICSP-001 section 8.2).
 const (
-	MethodHello            = "_intercom/hello"
-	MethodPeerList         = "_intercom/peer/list"
-	MethodPeerResolve      = "_intercom/peer/resolve"
-	MethodPeerCapabilities = "_intercom/peer/capabilities"
-	MethodPeerPresence     = "_intercom/peer/presence"
-	MethodMessageSend      = "_intercom/message/send"
-	MethodMessageStatus    = "_intercom/message/status"
-	MethodMessageReply     = "_intercom/message/reply"
-	MethodSessionState     = "_intercom/session/state"
-	MethodSessionSnapshot  = "_intercom/session/snapshot"
-	MethodSessionReplay    = "_intercom/session/replay"
-	MethodSessionSubscribe = "_intercom/session/subscribe"
-	MethodEvent            = "_intercom/event"
+	MethodHello            = ExtensionPrefix + "hello"
+	MethodPeerList         = ExtensionPrefix + "peer/list"
+	MethodPeerResolve      = ExtensionPrefix + "peer/resolve"
+	MethodPeerCapabilities = ExtensionPrefix + "peer/capabilities"
+	MethodPeerPresence     = ExtensionPrefix + "peer/presence"
+	MethodMessageSend      = ExtensionPrefix + "message/send"
+	MethodMessageStatus    = ExtensionPrefix + "message/status"
+	MethodMessageReply     = ExtensionPrefix + "message/reply"
+	MethodSessionState     = ExtensionPrefix + "session/state"
+	MethodSessionSnapshot  = ExtensionPrefix + "session/snapshot"
+	MethodSessionReplay    = ExtensionPrefix + "session/replay"
+	MethodSessionSubscribe = ExtensionPrefix + "session/subscribe"
+	MethodEvent            = ExtensionPrefix + "event"
 
 	// Methods below support the adapter contract in section 12. They let an
 	// out-of-process adapter register its honest capability set, claim the
 	// messages waiting in its own inbox, and report what it actually did.
-	MethodSessionRegister    = "_intercom/session/register"
-	MethodMessageListPending = "_intercom/message/listPending"
-	MethodMessageReport      = "_intercom/message/report"
-	MethodHeartbeat          = "_intercom/heartbeat"
-	MethodPermissionGrant    = "_intercom/permission/grant"
-	MethodPermissionRevoke   = "_intercom/permission/revoke"
-	MethodPermissionList     = "_intercom/permission/list"
+	MethodSessionRegister    = ExtensionPrefix + "session/register"
+	MethodMessageListPending = ExtensionPrefix + "message/listPending"
+	MethodMessageReport      = ExtensionPrefix + "message/report"
+	MethodHeartbeat          = ExtensionPrefix + "heartbeat"
+	MethodPermissionGrant    = ExtensionPrefix + "permission/grant"
+	MethodPermissionRevoke   = ExtensionPrefix + "permission/revoke"
+	MethodPermissionList     = ExtensionPrefix + "permission/list"
 )
 
-// IntercomMethodPrefix identifies methods belonging to the Intercom extension.
-const IntercomMethodPrefix = "_intercom/"
+// IntercomMethodPrefix identifies methods belonging to the Intercom
+// extension.
+const IntercomMethodPrefix = ExtensionPrefix
 
 // IsIntercomMethod reports whether method belongs to the Intercom extension.
 func IsIntercomMethod(method string) bool {

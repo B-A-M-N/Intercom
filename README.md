@@ -40,6 +40,11 @@ orchestrator.
 **Interoperability layer.** Adapters that translate a harness's native
 surface into the Intercom contract.
 
+The ACP extension is published under the reverse-DNS namespace
+`dev.bamn.intercom`, as section 8.1 requires before a stable extension is
+published. The specification's `_intercom/` examples are provisional and
+are not used here.
+
 ### Language split
 
 The core is Go. The adapters are Python.
