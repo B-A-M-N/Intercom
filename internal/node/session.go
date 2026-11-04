@@ -175,6 +175,87 @@ func (n *Node) Recover(ctx context.Context) (RecoveryReport, error) {
 	return report, nil
 }
 
+// RegisterAdapterSession records an out-of-process adapter's session and its
+// advertised capability set.
+//
+// The capabilities come from the adapter, and the Go core stores them
+// verbatim so that every peer sees exactly what the harness claimed. The
+// core does not upgrade an adapter's claims.
+func (n *Node) RegisterAdapterSession(ctx context.Context, peer protocol.PeerInfo) error {
+	if peer.SessionID == "" {
+		return protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
+	}
+	if peer.InstanceID == "" {
+		return protocol.Errorf(protocol.CodeInvalidParams, "instanceId is required")
+	}
+	if peer.PrincipalID == "" {
+		peer.PrincipalID = n.principalID
+	}
+	if peer.HostID == "" {
+		peer.HostID = n.hostID
+	}
+	if peer.Presence == "" {
+		peer.Presence = protocol.PresenceOnline
+	}
+
+	if err := n.store.RegisterSession(ctx, peer); err != nil {
+		return err
+	}
+	if _, err := n.store.AppendEvent(ctx, protocol.EventEnvelope{
+		EventID:   mustID("evt"),
+		SessionID: peer.SessionID,
+		EventType: protocol.EventSessionCreated,
+		Timestamp: time.Now().UTC(),
+		Payload:   mustJSON(peer),
+	}, ""); err != nil {
+		return err
+	}
+	return n.store.Audit(ctx, n.principalID, peer.SessionID, "adapter.registered", peer.Harness)
+}
+
+// PendingInbox returns the messages waiting for a session to claim.
+//
+// An out-of-process adapter uses this to claim its own messages. The
+// messages stay in the durable inbox until an adapter reports an outcome.
+func (n *Node) PendingInbox(ctx context.Context, sessionID string, limit int) ([]protocol.Message, error) {
+	if _, err := n.store.GetSession(ctx, sessionID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", sessionID)
+		}
+		return nil, err
+	}
+	if limit <= 0 || limit > n.cfg.Limits.MaxReplayBatch {
+		limit = n.cfg.Limits.MaxReplayBatch
+	}
+	msgs, err := n.store.PendingInbox(ctx, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if msgs == nil {
+		msgs = []protocol.Message{}
+	}
+	return msgs, nil
+}
+
+// ReportDelivery records an adapter's observed delivery outcome.
+//
+// The receipt is appended to the same trail as the core's own receipts, so
+// the sender sees one ordered history of what happened to its message.
+func (n *Node) ReportDelivery(ctx context.Context, messageID string, status protocol.ReceiptStatus, detail string) error {
+	if !status.Valid() {
+		return protocol.Errorf(protocol.CodeInvalidParams, "invalid receipt status %q", status)
+	}
+	msg, err := n.store.GetMessage(ctx, messageID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return protocol.Errorf(protocol.CodeInvalidParams, "unknown messageId %q", messageID)
+		}
+		return err
+	}
+	n.recordReceipt(ctx, msg, status, detail)
+	return nil
+}
+
 // RecoveryReport summarizes a recovery pass.
 type RecoveryReport struct {
 	// Unsettled counts commands that were admitted without settlement.

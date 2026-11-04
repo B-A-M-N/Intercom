@@ -124,6 +124,13 @@ const (
 	MethodSessionReplay    = "_intercom/session/replay"
 	MethodSessionSubscribe = "_intercom/session/subscribe"
 	MethodEvent            = "_intercom/event"
+
+	// Methods below support the adapter contract in section 12. They let an
+	// out-of-process adapter register its honest capability set, claim the
+	// messages waiting in its own inbox, and report what it actually did.
+	MethodSessionRegister    = "_intercom/session/register"
+	MethodMessageListPending = "_intercom/message/listPending"
+	MethodMessageReport      = "_intercom/message/report"
 )
 
 // IntercomMethodPrefix identifies methods belonging to the Intercom extension.

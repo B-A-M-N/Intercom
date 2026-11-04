@@ -138,6 +138,12 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		return s.sessionReplay(ctx, params)
 	case protocol.MethodSessionSubscribe:
 		return s.sessionSubscribe(ctx, params)
+	case protocol.MethodSessionRegister:
+		return s.sessionRegister(ctx, params)
+	case protocol.MethodMessageListPending:
+		return s.messageListPending(ctx, params)
+	case protocol.MethodMessageReport:
+		return s.messageReport(ctx, params)
 	default:
 		if protocol.IsIntercomMethod(method) {
 			return nil, protocol.Errorf(protocol.CodeMethodNotFound, "unknown Intercom method %q", method)
@@ -477,6 +483,112 @@ func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (
 	}
 	s.n.Subscribe(p.Session)
 	return SessionSubscribeResult{SessionID: p.Session, Subscribed: true}, nil
+}
+
+// sessionRegisterParams are the parameters of _intercom/session/register.
+type sessionRegisterParams struct {
+	SessionID     string                  `json:"sessionId"`
+	InstanceID    string                  `json:"instanceId"`
+	Alias         string                  `json:"alias,omitempty"`
+	Harness       string                  `json:"harness"`
+	Version       string                  `json:"harnessVersion,omitempty"`
+	HostID        string                  `json:"hostId,omitempty"`
+	PrincipalID   string                  `json:"principalId,omitempty"`
+	Capabilities  []protocol.Capability   `json:"capabilities"`
+	DeliveryModes []protocol.DeliveryMode `json:"deliveryModes"`
+}
+
+// sessionRegisterResult is the response to _intercom/session/register.
+type sessionRegisterResult struct {
+	SessionID  string `json:"sessionId"`
+	Registered bool   `json:"registered"`
+}
+
+// sessionRegister records an out-of-process adapter's session.
+//
+// The adapter's capability claims are stored as given. The core does not
+// upgrade them, and an adapter that claims a capability it cannot implement
+// is caught by the conformance tests rather than by the core guessing.
+func (s *Server) sessionRegister(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p sessionRegisterParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.SessionID == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
+	}
+	if p.InstanceID == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "instanceId is required")
+	}
+
+	peer := protocol.PeerInfo{
+		SessionID:      p.SessionID,
+		InstanceID:     p.InstanceID,
+		Alias:          p.Alias,
+		Harness:        p.Harness,
+		HarnessVersion: p.Version,
+		HostID:         p.HostID,
+		PrincipalID:    p.PrincipalID,
+		Capabilities:   p.Capabilities,
+		Delivery:       p.DeliveryModes,
+		Presence:       protocol.PresenceOnline,
+	}
+	if err := s.n.RegisterAdapterSession(ctx, peer); err != nil {
+		return nil, toRPCError(err)
+	}
+	return sessionRegisterResult{SessionID: p.SessionID, Registered: true}, nil
+}
+
+// messageListPendingParams are the parameters of _intercom/message/listPending.
+type messageListPendingParams struct {
+	Session string `json:"sessionId"`
+	Limit   int    `json:"limit,omitempty"`
+}
+
+// messageListPendingResult is the response to _intercom/message/listPending.
+type messageListPendingResult struct {
+	Messages []protocol.Message `json:"messages"`
+}
+
+// messageListPending returns the messages waiting in a session's inbox.
+func (s *Server) messageListPending(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p messageListPendingParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.Session == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
+	}
+	msgs, err := s.n.PendingInbox(ctx, p.Session, p.Limit)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return messageListPendingResult{Messages: msgs}, nil
+}
+
+// messageReportParams are the parameters of _intercom/message/report.
+type messageReportParams struct {
+	MessageID string                 `json:"messageId"`
+	Status    protocol.ReceiptStatus `json:"status"`
+	Detail    string                 `json:"detail,omitempty"`
+}
+
+// messageReportResult is the response to _intercom/message/report.
+type messageReportResult struct {
+	MessageID string                 `json:"messageId"`
+	Status    protocol.ReceiptStatus `json:"status"`
+}
+
+// messageReport records an adapter's observed delivery outcome.
+func (s *Server) messageReport(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p messageReportParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := s.n.ReportDelivery(ctx, p.MessageID, p.Status, p.Detail); err != nil {
+		return nil, toRPCError(err)
+	}
+	return messageReportResult{MessageID: p.MessageID, Status: p.Status}, nil
 }
 
 // sender returns the transport-authenticated sender identity.
