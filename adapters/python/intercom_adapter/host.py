@@ -79,7 +79,20 @@ class AdapterHost:
         new instance id while the session identity is preserved (ICSP-001
         section 3).
         """
-        hello = self.client.call(f"{EXTENSION_PREFIX}hello")
+        # The host states what it needs before it depends on it. The
+        # negotiation fails safely if the host cannot satisfy those needs,
+        # rather than the adapter discovering it later (ICSP-001 section
+        # 8.3).
+        hello = self.client.call(
+            f"{EXTENSION_PREFIX}hello",
+            {
+                "require": list(self.required_capabilities()),
+                "clientInfo": {
+                    "name": self.harness.identity[0],
+                    "version": self.harness.identity[1],
+                },
+            },
+        )
 
         payload = {
             "sessionId": self.cfg.session_id,
@@ -106,6 +119,20 @@ class AdapterHost:
             "specVersion": hello.get("specVersion", ""),
             "profiles": hello.get("profiles", []),
         }
+
+    def required_capabilities(self) -> list[str]:
+        """The capabilities this adapter host cannot operate without.
+
+        A host needs peer discovery, the ability to send, and a durable
+        command ledger. It does not require steering, because a harness
+        that cannot steer still serves the other delivery modes.
+        """
+        return [
+            "peer.discovery",
+            "peer.send",
+            "command.durable",
+            "session.observe",
+        ]
 
     # -- delivery ----------------------------------------------------------
 

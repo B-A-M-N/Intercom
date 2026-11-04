@@ -135,7 +135,7 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "initialize":
 		return s.initializeResult(), nil
 	case protocol.MethodHello:
-		return s.hello()
+		return s.hello(ctx, params)
 	case protocol.MethodPeerList:
 		return s.peerList(ctx)
 	case protocol.MethodPeerResolve:
@@ -180,16 +180,85 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	}
 }
 
+// HelloParams are the parameters of the extension's hello method.
+//
+// A client states the features it requires, so the host can fail the
+// negotiation safely rather than accepting a connection that cannot work
+// (ICSP-001 section 8.3).
+type HelloParams struct {
+	// Require lists the capability identifiers the client cannot operate
+	// without.
+	Require []protocol.CapabilityID `json:"require,omitempty"`
+	// Profiles lists the conformance profiles the client needs.
+	Profiles []string `json:"profiles,omitempty"`
+	// ClientInfo names the client.
+	ClientInfo map[string]any `json:"clientInfo,omitempty"`
+}
+
 // hello negotiates protocol features.
-func (s *Server) hello() (HelloResult, *protocol.RPCError) {
+//
+// Negotiation fails safely when a required feature is unsupported: the
+// request is refused with the unsupported code and the list of what was
+// missing, rather than the connection being accepted and failing later.
+func (s *Server) hello(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p HelloParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+
+	advertised := s.n.CapabilityAdvertisement()
+
+	// Build the supported set, so a requirement can be checked against
+	// what is actually available rather than against what is named.
+	supported := make(map[protocol.CapabilityID]protocol.SupportLevel, len(advertised))
+	for _, c := range advertised {
+		supported[c.ID] = c.Support
+	}
+
+	var missing []protocol.CapabilityID
+	for _, want := range p.Require {
+		level, ok := supported[want]
+		if !ok || level == protocol.SupportUnsupported {
+			missing = append(missing, want)
+		}
+	}
+
+	// The profiles a client requires must also be available.
+	available := map[string]bool{}
+	for _, profile := range s.n.SupportedProfiles() {
+		available[profile] = true
+	}
+	var missingProfiles []string
+	for _, want := range p.Profiles {
+		if !available[want] {
+			missingProfiles = append(missingProfiles, want)
+		}
+	}
+
+	if len(missing) > 0 || len(missingProfiles) > 0 {
+		return nil, protocol.Errorf(protocol.CodeUnsupported,
+			"the requested features are not available: capabilities %v, profiles %v",
+			missing, missingProfiles).
+			WithData(map[string]any{
+				"missingCapabilities": missing,
+				"missingProfiles":     missingProfiles,
+				"supported":           advertised,
+			})
+	}
+
+	return s.helloResult(advertised), nil
+}
+
+// helloResult builds the successful negotiation response.
+func (s *Server) helloResult(advertised []protocol.Capability) HelloResult {
 	return HelloResult{
 		SpecVersion:  protocol.SpecVersion,
 		SpecRevision: protocol.SpecRevision,
 		Namespace:    protocol.ExtensionNamespace,
 		Prefix:       protocol.ExtensionPrefix,
-		Capabilities: s.n.CapabilityAdvertisement(),
+		Capabilities: advertised,
 		Profiles:     s.n.SupportedProfiles(),
-	}, nil
+	}
 }
 
 // PeerListParams are the parameters of _intercom/peer/list.

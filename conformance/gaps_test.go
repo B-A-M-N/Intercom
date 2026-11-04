@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bamn/intercom/internal/adapter"
+	"github.com/bamn/intercom/internal/adapter/acp"
 	"github.com/bamn/intercom/internal/config"
 	"github.com/bamn/intercom/internal/node"
 	"github.com/bamn/intercom/internal/protocol"
@@ -606,5 +607,62 @@ func Test_SessionStateDistinguishesNativeFromInferred(t *testing.T) {
 	}
 	if presence != protocol.PresenceDisconnected {
 		t.Errorf("presence after disconnect = %q, want disconnected", presence)
+	}
+}
+
+// Test_NegotiationFailsSafely covers the negotiation requirement of spec
+// section 8.3.
+//
+// Negotiation MUST fail safely when a required feature is unsupported.
+func Test_NegotiationFailsSafely(t *testing.T) {
+	e := newEnv(t)
+	srv := acp.NewServer(e.node, e.node.PrincipalID(), e.aliceID)
+
+	// A requirement the host cannot satisfy is refused, and the refusal
+	// names what was missing.
+	_, rpcErr := srv.HandleValue(e.ctx, protocol.MethodHello, map[string]any{
+		"require": []string{"delivery.steer", "peer.discovery"},
+	})
+	if rpcErr == nil {
+		t.Fatal("a negotiation requiring an unsupported feature succeeded")
+	}
+	if rpcErr.Code != protocol.CodeUnsupported {
+		t.Errorf("error code = %d, want %d (unsupported)", rpcErr.Code, protocol.CodeUnsupported)
+	}
+	if len(rpcErr.Data) == 0 {
+		t.Error("the refusal does not name the missing features")
+	}
+
+	// A requirement the host does satisfy is accepted.
+	result, rpcErr := srv.HandleValue(e.ctx, protocol.MethodHello, map[string]any{
+		"require": []string{"peer.discovery", "peer.send"},
+	})
+	if rpcErr != nil {
+		t.Fatalf("a satisfiable negotiation was refused: %v", rpcErr)
+	}
+	hello, ok := result.(acp.HelloResult)
+	if !ok {
+		t.Fatalf("hello returned %T", result)
+	}
+	if hello.Namespace != protocol.ExtensionNamespace {
+		t.Errorf("namespace = %q, want %q", hello.Namespace, protocol.ExtensionNamespace)
+	}
+
+	// A required profile the host does not implement is also refused.
+	_, rpcErr = srv.HandleValue(e.ctx, protocol.MethodHello, map[string]any{
+		"profiles": []string{"IC-REMOTE"},
+	})
+	if rpcErr == nil {
+		t.Fatal("a negotiation requiring an unimplemented profile succeeded")
+	}
+	if rpcErr.Code != protocol.CodeUnsupported {
+		t.Errorf("error code = %d, want %d (unsupported)", rpcErr.Code, protocol.CodeUnsupported)
+	}
+
+	// A profile the host does implement is accepted.
+	if _, rpcErr := srv.HandleValue(e.ctx, protocol.MethodHello, map[string]any{
+		"profiles": []string{"IC-LOCAL", "IC-DURABLE"},
+	}); rpcErr != nil {
+		t.Fatalf("a satisfiable profile requirement was refused: %v", rpcErr)
 	}
 }
