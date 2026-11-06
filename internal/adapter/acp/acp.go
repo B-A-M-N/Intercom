@@ -1102,6 +1102,9 @@ func (s *Server) surfaceReplay(ctx context.Context, params json.RawMessage) (any
 		Mode protocol.DeliveryMode `json:"mode"`
 		CreatedAt string `json:"createdAt"`
 		Status protocol.ReceiptStatus `json:"status"`
+		HumanStatus protocol.ReceiptStatus `json:"humanStatus"`
+		AgentStatus protocol.ReceiptStatus `json:"agentStatus"`
+		AgentDetail string `json:"agentDetail,omitempty"`
 	}
 	out := make([]evOut, 0, len(events))
 	for _, e := range events {
@@ -1109,7 +1112,7 @@ func (s *Server) surfaceReplay(ctx context.Context, params json.RawMessage) (any
 			MessageID: e.Message.MessageID, CommandID: e.Message.CommandID,
 			From: e.Message.From, To: e.Message.To, Body: e.Message.Body,
 			Mode: e.Message.Delivery.Mode, CreatedAt: e.Message.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			Status: e.Status,
+			Status: e.HumanStatus, HumanStatus: e.HumanStatus, AgentStatus: e.AgentStatus, AgentDetail: e.AgentDetail,
 		})
 	}
 	return map[string]any{"sessionId": p.Session, "events": out, "cursor": next}, nil

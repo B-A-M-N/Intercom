@@ -101,34 +101,45 @@ class TestSurfaceBridge(unittest.TestCase):
         # Cursor resume must not duplicate the already-seen message.
         self.assertNotIn(mid, ids2, f"cursor resume duplicated {ids2}")
         self.assertGreaterEqual(cursor2, cursor)
-        # Continuous delivery: display lines arriving via the bridge's own
-        # stream must reach a consumer, not be discarded. Poll for them
-        # after a fresh send; drain via the driver's queue.
-        import threading
-        seen = []
-        stop = threading.Event()
-        def _collect(ev):
-            seen.append(ev)
-        # Probe by polling the queue briefly (bridge streams display lines).
-        for _ in range(5):
-            drained = bridge2.drain_events()
-            seen.extend(drained)
-            if seen:
+        # Continuous delivery: a NEW message sent while the surface is
+        # attached must reach a UI callback via the queued stream, not just
+        # be documented as list-shaped.
+        import threading as _threading
+        import time as _time
+        sent2 = ac.call(f"{EXT}message/send", {"commandId": "cmd_surface_alice2bob2", "to": {"sessionId": bob}, "body": {"type": "text", "text": "second ping"}, "delivery": {"mode": "notify", "wake": "none", "onUnsupported": "reject"}})
+        mid2 = sent2.get("messageId")
+        # Existing UI simulation: render_status_line is what a TUI/status bar
+        # would show; the callback is the host integration point.
+        from intercom_adapter.surface_client import render_status_line
+        consumed = []
+        stop = _threading.Event()
+        def _on_event(ev):
+            consumed.append(render_status_line(ev.get("message", {})))
+            consumed.append(ev)
+        # Poll for up to ~8s for the fresh message to arrive via drain/poll.
+        deadline = _time.time() + 8
+        found_mid = None
+        while _time.time() < deadline:
+            for ev in bridge2.drain_events():
+                _on_event(ev)
+                msg = ev.get("message") or {}
+                if msg.get("messageId") == mid2:
+                    found_mid = mid2
+                    break
+            if found_mid:
                 break
-            import time as _time; _time.sleep(0.2)
-        # seen may be empty if no new message after cursor; still verify
-        # subscribe API exists and returns without error.
+            ev2 = bridge2.poll_events(timeout=0.2)
+            if ev2 is not None:
+                _on_event(ev2)
+                msg = ev2.get("message") or {}
+                if msg.get("messageId") == mid2:
+                    found_mid = mid2
+                    break
+        self.assertEqual(found_mid, mid2, f"new message {mid2} never reached UI callback; consumed={consumed}")
         # Continuous consumption API must be non-blocking when polled with a set stop.
-        stop = threading.Event(); stop.set()
-        cnt = bridge2.subscribe(lambda ev: seen.append(ev), stop, timeout=0.05)
+        stop.set()
+        cnt = bridge2.subscribe(lambda ev: consumed.append(ev), stop, timeout=0.05)
         self.assertGreaterEqual(cnt, 0)
-        # Continuous delivery proof: events arriving via the bridge stream
-        # are queued and forwarded (drain_events).
-        # The surface poller emits display lines; wait for at least one if a
-        # new message exists is not required here - we already proved cursor
-        # resume, so just exercise the queue path.
-        drained2 = bridge2.drain_events()
-        self.assertIsInstance(drained2, list)
         # Reply idempotency: same commandId twice must not create a second
         # reply body. Driver generates/retains one.
         rep1 = bridge2.reply(mid, "idempotent hello")

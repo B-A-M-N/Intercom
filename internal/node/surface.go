@@ -13,6 +13,9 @@ type DisplayEvent struct {
 	Message protocol.Message
 	Status protocol.ReceiptStatus
 	Detail string
+	HumanStatus protocol.ReceiptStatus
+	AgentStatus protocol.ReceiptStatus
+	AgentDetail string
 }
 
 // SurfaceReplay returns displayable events for the bound session without
@@ -49,7 +52,7 @@ func (n *Node) SurfaceReplayWithGap(ctx context.Context, sender Sender, sessionI
 	}
 	out := make([]DisplayEvent, 0, len(res.Events))
 	for _, e := range res.Events {
-		out = append(out, DisplayEvent{Message: e.Message, Status: e.ReceiptStatus, Detail: e.ReceiptDetail})
+		out = append(out, DisplayEvent{Message: e.Message, Status: e.HumanStatus, Detail: e.ReceiptDetail, HumanStatus: e.HumanStatus, AgentStatus: e.AgentStatus, AgentDetail: e.AgentDetail})
 	}
 	return out, int(res.Cursor), res.Gap, res.EarliestAvailable, nil
 }

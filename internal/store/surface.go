@@ -10,21 +10,26 @@ import (
 	"github.com/B-A-M-N/intercom/internal/protocol"
 )
 
-// DisplayEvent is one displayable unit for a human surface.
+// DisplayEvent is one displayable unit for a human surface. Human
+// presentation and agent transport are independent fields and must not
+// be collapsed into one status.
 type DisplayEvent struct {
 	Message protocol.Message
-	ReceiptStatus protocol.ReceiptStatus
+	ReceiptStatus protocol.ReceiptStatus // human truth (compat)
 	ReceiptDetail string
+	HumanStatus protocol.ReceiptStatus
+	AgentStatus protocol.ReceiptStatus
+	AgentDetail string
 }
 
-// presentationStatus reports human presentation truth independently of
-// agent inbox state: presented if a presented receipt exists, else delivered.
+// presentationStatus reports human presentation truth: presented/handled
+// if observed, else unknown. It never claims delivered (agent transport).
 func (s *Store) presentationStatus(ctx context.Context, messageID string) (protocol.ReceiptStatus, string) {
 	receipts, err := s.ReceiptsFor(ctx, messageID)
 	if err != nil || len(receipts) == 0 {
-		return protocol.ReceiptDelivered, ""
+		return protocol.ReceiptUnknown, ""
 	}
-	status := protocol.ReceiptDelivered
+	status := protocol.ReceiptUnknown
 	detail := ""
 	for _, r := range receipts {
 		if r.Status == protocol.ReceiptPresented {
@@ -32,6 +37,24 @@ func (s *Store) presentationStatus(ctx context.Context, messageID string) (proto
 			detail = r.Detail
 		} else if r.Status == protocol.ReceiptHandled {
 			status = protocol.ReceiptHandled
+			detail = r.Detail
+		}
+	}
+	return status, detail
+}
+
+// agentStatus reports the latest agent transport outcome independently.
+func (s *Store) agentStatus(ctx context.Context, messageID string) (protocol.ReceiptStatus, string) {
+	receipts, err := s.ReceiptsFor(ctx, messageID)
+	if err != nil || len(receipts) == 0 {
+		return protocol.ReceiptUnknown, ""
+	}
+	status := protocol.ReceiptUnknown
+	detail := ""
+	for _, r := range receipts {
+		switch r.Status {
+		case protocol.ReceiptDelivered, protocol.ReceiptRejected, protocol.ReceiptExpired, protocol.ReceiptInjected, protocol.ReceiptAccepted:
+			status = r.Status
 			detail = r.Detail
 		}
 	}
@@ -88,11 +111,18 @@ func (s *Store) ListDisplayEventsBySequence(ctx context.Context, sessionID strin
 	if fErr != nil {
 		return SurfaceReplayResult{}, fErr
 	}
-	if floor > 0 && afterSeq < floor {
+	if floor > 0 && afterSeq < floor-1 {
 		return SurfaceReplayResult{Events: nil, Cursor: afterSeq, Gap: true, EarliestAvailable: earliestVal}, nil
 	}
 	if earliest.Valid && afterSeq != 0 && afterSeq+1 < earliestVal {
-		return SurfaceReplayResult{Events: nil, Cursor: afterSeq, Gap: true, EarliestAvailable: earliestVal}, nil
+		// Cursor below retained earliest event: gap (events compacted).
+		// But if afterSeq >= floor-1 and earliest is the first retained non-message event,
+		// allow replay from floor-1 (message.accepted filter handles it). Only gap if the
+		// next message.accepted event itself was removed, which floor check already ensures.
+		// For safety when floor==0 (no compaction), any earliest gap is real.
+		if floor == 0 {
+			return SurfaceReplayResult{Events: nil, Cursor: afterSeq, Gap: true, EarliestAvailable: earliestVal}, nil
+		}
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT sequence, payload FROM session_events WHERE session_id = ? AND event_type = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?`,
@@ -135,8 +165,9 @@ func (s *Store) ListDisplayEventsBySequence(ctx context.Context, sessionID strin
 			// Message purged but journal remains: required history gone.
 			return SurfaceReplayResult{Events: out, Cursor: next, Gap: true, EarliestAvailable: earliestVal, MissingMessageID: obj.MessageID}, nil
 		}
-		status, detail := s.presentationStatus(ctx, obj.MessageID)
-		out = append(out, DisplayEvent{Message: msg, ReceiptStatus: status, ReceiptDetail: detail})
+		human, hdetail := s.presentationStatus(ctx, obj.MessageID)
+		agent, adetail := s.agentStatus(ctx, obj.MessageID)
+		out = append(out, DisplayEvent{Message: msg, ReceiptStatus: human, ReceiptDetail: hdetail, HumanStatus: human, AgentStatus: agent, AgentDetail: adetail})
 		next = rec.seq
 	}
 	return SurfaceReplayResult{Events: out, Cursor: next, Gap: false, EarliestAvailable: earliestVal}, nil
