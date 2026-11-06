@@ -58,6 +58,18 @@ func (s *Server) SetDelegation(role, token string) {
 // attachedAllowlist is the strict method set for scope=mcp clients.
 // Notably absent: session/register, session/delegate, session/attach,
 // permission/*, conversation/create|close, remote/*.
+var surfaceAllowlist = map[string]bool{
+	"initialize": true,
+	protocol.MethodHello: true,
+	protocol.MethodSurfaceReplay: true,
+	protocol.MethodSurfacePresent: true,
+	protocol.MethodSurfaceReply: true,
+	protocol.MethodMessageStatus: true,
+	protocol.MethodSessionState: true,
+	protocol.MethodSessionSnapshot: true,
+	protocol.MethodHeartbeat: true,
+}
+
 var attachedAllowlist = map[string]bool{
 	"initialize": true,
 	protocol.MethodHello: true,
@@ -178,11 +190,35 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		if s.peerSession == "" || s.delegationToken == "" {
 			return nil, protocol.Errorf(protocol.CodeForbidden, "attached client has no delegation")
 		}
-		if _, err := s.n.VerifyDelegationDetailed(ctx, s.peerSession, s.delegationToken); err != nil {
+		if s.delegationToken == "" {
+			return nil, protocol.Errorf(protocol.CodeForbidden, "attached client has no delegation")
+		}
+		info, err := s.n.VerifyDelegationDetailed(ctx, s.peerSession, s.delegationToken)
+		if err != nil {
 			return nil, protocol.Errorf(protocol.CodeForbidden, "delegation expired, revoked, or superseded")
 		}
-		if !attachedAllowlist[method] {
-			return nil, protocol.Errorf(protocol.CodeForbidden, "attached MCP client (scope=mcp) may not invoke %q", method)
+		if info.Scope == "surface" {
+			if !surfaceAllowlist[method] {
+				return nil, protocol.Errorf(protocol.CodeForbidden, "attached surface client (scope=surface) may not invoke %q", method)
+			}
+			switch method {
+			case protocol.MethodSurfacePresent:
+				if !info.Has("present") {
+					return nil, protocol.Errorf(protocol.CodeForbidden, "surface token lacks present permission")
+				}
+			case protocol.MethodSurfaceReply:
+				if !info.Has("reply") {
+					return nil, protocol.Errorf(protocol.CodeForbidden, "surface token lacks reply permission")
+				}
+			case protocol.MethodSurfaceReplay, protocol.MethodMessageStatus:
+				if !info.Has("read") {
+					return nil, protocol.Errorf(protocol.CodeForbidden, "surface token lacks read permission")
+				}
+			}
+		} else {
+			if !attachedAllowlist[method] {
+				return nil, protocol.Errorf(protocol.CodeForbidden, "attached MCP client (scope=mcp) may not invoke %q", method)
+			}
 		}
 	}
 	switch method {
@@ -230,6 +266,12 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		return s.sessionSubscribe(ctx, params)
 	case protocol.MethodSessionRegister:
 		return s.sessionRegister(ctx, params)
+	case protocol.MethodSurfaceReplay:
+		return s.surfaceReplay(ctx, params)
+	case protocol.MethodSurfacePresent:
+		return s.surfacePresent(ctx, params)
+	case protocol.MethodSurfaceReply:
+		return s.surfaceReply(ctx, params)
 	case protocol.MethodSessionDelegation:
 		return s.sessionDelegate(ctx, params)
 	case protocol.MethodSessionAttach:
@@ -1006,15 +1048,103 @@ type sessionRegisterResult struct {
 func (s *Server) sessionDelegate(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
 	var p struct {
 		Session string `json:"sessionId"`
+		Scope string `json:"scope"`
+		Permissions string `json:"permissions"`
 	}
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
+	}
+	if p.Scope == "surface" {
+		perms := p.Permissions
+		if perms == "" {
+			perms = "read,present,reply"
+		}
+		token, err := s.n.SurfaceIssueDelegation(ctx, s.sender(), p.Session, perms, 0)
+		if err != nil {
+			return nil, toRPCError(err)
+		}
+		return map[string]any{"delegationToken": token, "sessionId": p.Session, "scope": "surface", "permissions": perms}, nil
 	}
 	token, err := s.n.IssueDelegationFor(ctx, s.sender(), p.Session)
 	if err != nil {
 		return nil, toRPCError(err)
 	}
 	return map[string]any{"delegationToken": token, "sessionId": p.Session, "scope": "mcp"}, nil
+}
+
+func (s *Server) surfaceReplay(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p struct {
+		Session string `json:"sessionId"`
+		AfterPosition int `json:"afterPosition,omitempty"`
+		Cursor int `json:"cursor,omitempty"`
+		Limit int `json:"limit,omitempty"`
+	}
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	after := p.AfterPosition
+	if p.Cursor != 0 && after == 0 {
+		after = p.Cursor
+	}
+	events, next, err := s.n.SurfaceReplay(ctx, s.sender(), p.Session, after, p.Limit)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	type evOut struct {
+		MessageID string `json:"messageId"`
+		CommandID string `json:"commandId"`
+		From string `json:"from"`
+		To string `json:"to"`
+		Body protocol.MessageBody `json:"body"`
+		Mode protocol.DeliveryMode `json:"mode"`
+		CreatedAt string `json:"createdAt"`
+		Status protocol.ReceiptStatus `json:"status"`
+	}
+	out := make([]evOut, 0, len(events))
+	for _, e := range events {
+		out = append(out, evOut{
+			MessageID: e.Message.MessageID, CommandID: e.Message.CommandID,
+			From: e.Message.From, To: e.Message.To, Body: e.Message.Body,
+			Mode: e.Message.Delivery.Mode, CreatedAt: e.Message.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			Status: e.Status,
+		})
+	}
+	return map[string]any{"sessionId": p.Session, "events": out, "cursor": next}, nil
+}
+
+func (s *Server) surfacePresent(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.MessageID == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "messageId is required")
+	}
+	if err := s.n.SurfacePresent(ctx, s.sender(), p.MessageID); err != nil {
+		return nil, toRPCError(err)
+	}
+	return map[string]any{"messageId": p.MessageID, "presented": true}, nil
+}
+
+func (s *Server) surfaceReply(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p struct {
+		MessageID string `json:"messageId"`
+		CommandID string `json:"commandId"`
+		Text string `json:"text"`
+	}
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.MessageID == "" || p.Text == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "messageId and text are required")
+	}
+	res, err := s.n.SurfaceReply(ctx, s.sender(), p.MessageID, p.CommandID, p.Text)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return res, nil
 }
 
 // sessionAttach verifies a delegation token and binds this connection as an

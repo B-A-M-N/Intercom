@@ -302,7 +302,7 @@ class MuseAdapter(BaseHarness):
         (ICSP-001 section 12).
 
         So the notification is recorded in the adapter host, which is an
-        operator-visible surface, and reported as "presented". It is never
+        durable notification sink (persistence only, not presentation; a connected surface must confirm rendering), and reported as "presented". It is never
         reported as "injected", because nothing was injected.
         """
         text = _message_text(message)
@@ -314,7 +314,7 @@ class MuseAdapter(BaseHarness):
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
             detail=(
-                "recorded in the adapter host's operator surface; "
+                "recorded in the adapter host's durable notification sink (persistence only, not presentation); "
                 "not injected into the model context"
             ),
         )

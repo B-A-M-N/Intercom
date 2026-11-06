@@ -197,7 +197,11 @@ class BaseHarness:
         return self._persisted_mappings.get(intercom_session, "")
 
     def _notify_durable(self, session_id: str, text: str, message: dict[str, Any]) -> bool:
-        """Durably record a notification; True iff the operator inbox accepted it."""
+        """Durably record a notification sink entry; True iff the sink accepted it.
+
+        This is persistence only, not presentation: a durable write alone
+        never means presented. Only a connected surface confirming rendering
+        can move the receipt to (presented)."""
         notes = getattr(self, "_notes", None)
         if notes is not None:
             notes.setdefault(session_id, []).append(text)

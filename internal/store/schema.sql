@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS session_delegations (
     token_hash TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'mcp',
+    permissions TEXT NOT NULL DEFAULT '',
     owner_instance TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,

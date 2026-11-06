@@ -170,7 +170,7 @@ class HermesAdapter(BaseHarness):
             )
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
-            detail="recorded in the adapter host's operator surface; not injected into the model context",
+            detail="recorded in the adapter host's durable notification sink (persistence only, not presentation); not injected into the model context",
         )
 
     def notes(self, session_id: str) -> list[str]:

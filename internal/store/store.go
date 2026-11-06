@@ -123,6 +123,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE remote_transfers ADD COLUMN sender_session TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE remote_transfers ADD COLUMN envelope TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE remote_transfers ADD COLUMN next_retry_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE session_delegations ADD COLUMN permissions TEXT NOT NULL DEFAULT ''`,
 	} {
 		_, _ = db.ExecContext(ctx, add)
 	}

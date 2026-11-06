@@ -18,7 +18,7 @@ Claude Code has no server protocol with an active-turn injection point
 
 Delivery honesty for this adapter:
 
-    notify - native, via the adapter host's operator surface (presented)
+    notify - native, via the adapter host's durable notification sink (persistence only, not presentation) (presented)
     queue  - native: a user message on the stream-json input becomes
              the session's next turn
     steer  - unsupported: there is no documented active-turn injection
@@ -280,7 +280,7 @@ class ClaudeAdapter(BaseHarness):
             )
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
-            detail="recorded in the adapter host's operator surface; not injected into the model context",
+            detail="recorded in the adapter host's durable notification sink (persistence only, not presentation); not injected into the model context",
         )
 
     def notes(self, session_id: str) -> list[str]:

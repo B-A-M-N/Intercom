@@ -8,7 +8,7 @@ session/prompt runs a real model turn).
 
 What ACP gives this adapter, and what it does not:
 
-    notify - native, via the adapter host's operator surface (presented)
+    notify - native, via the adapter host's durable notification sink (persistence only, not presentation) (presented)
     queue  - native: session/prompt submits the next user turn
     steer  - unsupported: ACP has no active-turn injection point
 
@@ -182,7 +182,7 @@ class OpenCodeAdapter(BaseHarness):
             )
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
-            detail="recorded in the adapter host's operator surface; not injected into the model context",
+            detail="recorded in the adapter host's durable notification sink (persistence only, not presentation); not injected into the model context",
         )
 
     def notes(self, session_id: str) -> list[str]:
