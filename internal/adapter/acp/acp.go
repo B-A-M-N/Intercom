@@ -210,7 +210,7 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 				if !info.Has("reply") {
 					return nil, protocol.Errorf(protocol.CodeForbidden, "surface token lacks reply permission")
 				}
-			case protocol.MethodSurfaceReplay, protocol.MethodMessageStatus:
+			case protocol.MethodSurfaceReplay, protocol.MethodMessageStatus, protocol.MethodSessionState, protocol.MethodSessionSnapshot:
 				if !info.Has("read") {
 					return nil, protocol.Errorf(protocol.CodeForbidden, "surface token lacks read permission")
 				}
@@ -1086,9 +1086,12 @@ func (s *Server) surfaceReplay(ctx context.Context, params json.RawMessage) (any
 	if p.Cursor != 0 && after == 0 {
 		after = p.Cursor
 	}
-	events, next, err := s.n.SurfaceReplay(ctx, s.sender(), p.Session, after, p.Limit)
+	events, next, gap, earliest, err := s.n.SurfaceReplayWithGap(ctx, s.sender(), p.Session, uint64(after), p.Limit)
 	if err != nil {
 		return nil, toRPCError(err)
+	}
+	if gap {
+		return nil, protocol.Errorf(protocol.CodeCursorGap, "surface history gap; recover from earliestAvailable %d", earliest).WithData(map[string]any{"sessionId": p.Session, "earliestAvailable": earliest, "requestedCursor": after})
 	}
 	type evOut struct {
 		MessageID string `json:"messageId"`
