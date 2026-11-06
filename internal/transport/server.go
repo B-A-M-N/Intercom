@@ -8,7 +8,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
 
 // Handler answers a JSON-RPC request.
@@ -85,6 +85,12 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	s.conns[conn] = struct{}{}
 	s.mu.Unlock()
 
+	// Per-connection context: subscriptions and other connection-scoped
+	// work are cancelled when this connection closes, not when the
+	// daemon stops.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.conns, conn)
@@ -97,7 +103,7 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		frame, err := readFrame(ctx, conn)
+		frame, err := readFrame(connCtx, conn)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -107,7 +113,7 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 		if len(frame) == 0 {
 			continue
 		}
-		s.dispatch(ctx, conn, peer, frame)
+		s.dispatch(connCtx, conn, peer, frame)
 	}
 }
 

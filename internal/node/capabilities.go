@@ -1,7 +1,7 @@
 package node
 
 import (
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
 
 // Conformance profiles defined by ICSP-001 section 14.
@@ -32,6 +32,13 @@ func (n *Node) SupportedProfiles() []string {
 	return []string{ProfileLocal, ProfileDurable, ProfileACP}
 }
 
+// HarnessQualifications returns the per-harness qualification matrix:
+// what each known adapter advertises, implements, tests, and has
+// live-verified. Global profiles never imply per-harness capabilities.
+func (n *Node) HarnessQualifications() []protocol.CapabilityQualification {
+	return protocol.HarnessQualificationMatrix()
+}
+
 // CapabilityAdvertisement returns the capabilities this node advertises.
 //
 // Every capability states its support level, so a client can tell a natively
@@ -60,3 +67,13 @@ func (n *Node) CapabilityAdvertisement() []protocol.Capability {
 			}},
 	}
 }
+
+// Harness names are the adapter's registered harness strings. Claude Code
+// registers as "claude-code", not "claude".
+const (
+	HarnessMuse     = "muse"
+	HarnessCodex    = "codex"
+	HarnessOpenCode = "opencode"
+	HarnessHermes   = "hermes"
+	HarnessClaude   = "claude-code"
+)

@@ -17,4 +17,19 @@ launched prompt as successful active-turn steering (ICSP-001 sections 1.1
 and 12).
 """
 
-__all__ = ["client", "harness", "muse", "hermes"]
+__all__ = [
+    "acp_client",
+    "claude",
+    "client",
+    "codex",
+    "codex_client",
+    "harness",
+    "hermes",
+    "host",
+    "ids",
+    "mcp_consumer",
+    "msp",
+    "muse",
+    "opencode",
+    "stdio_rpc",
+]

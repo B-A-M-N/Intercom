@@ -49,6 +49,7 @@ class IntercomClient:
         self._next_id = 0
         self._pending: dict[int, PendingCall] = {}
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._reader: Optional[threading.Thread] = None
         self._closed = False
         self._notifications: list[Callable[[str, Any], None]] = []
@@ -62,10 +63,24 @@ class IntercomClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect(self._socket_path)
+        # Long-lived reads must not inherit the connect timeout: restore
+        # blocking behavior so an idle connection does not die after ~10s.
+        sock.settimeout(None)
         # The host frames on newlines, so the socket is a byte stream.
         self._sock = sock
+        self._closed = False
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+
+    def is_connected(self) -> bool:
+        """Whether this client believes its socket is live."""
+        return self._sock is not None and not self._closed
+
+    def reconnect(self, timeout: float = 10.0) -> None:
+        """Close and reopen the socket (caller re-registers after this)."""
+        self.close()
+        # close() sets _closed; connect() resets it on success.
+        self.connect(timeout=timeout)
 
     def close(self) -> None:
         """Close the connection and fail every in-flight call."""
@@ -145,7 +160,12 @@ class IntercomClient:
         if self._sock is None:
             raise RuntimeError("intercom client is not connected")
         data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-        self._sock.sendall(data)
+        # Heartbeat and delivery threads share this client: serialize whole
+        # frames so concurrent calls never interleave bytes.
+        with self._write_lock:
+            if self._sock is None:
+                raise RuntimeError("intercom client is not connected")
+            self._sock.sendall(data)
 
     def _read_loop(self) -> None:
         buffer = b""

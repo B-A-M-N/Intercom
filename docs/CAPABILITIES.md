@@ -14,14 +14,21 @@ different operation. That is the rule this matrix exists to make checkable.
 
 | Harness | Native surface | notify | queue | steer |
 |---|---|---|---|---|
-| Muse Code | MSP over stdio (`muse serve`) | native | native | **native** |
-| Hermes | ACP agent (`hermes-acp`) | native | native | **unsupported** |
-| Codex | `codex app-server` | not yet integrated | not yet integrated | unsupported |
-| Claude Code | `--print --output-format=stream-json` | not yet integrated | not yet integrated | unsupported |
+| Muse Code (`muse`, `musefi`, `openmuse` wrappers) | MSP over stdio (`muse serve`) | native | native | **native** |
+| Codex (stock `codex app-server --stdio`) | app-server JSON-RPC | native | native | **native** |
+| OpenCode (`opencode acp`) | ACP agent, protocolVersion 1 | native | native | **unsupported** |
+| Hermes (`hermes-acp`) | ACP agent | native | native | **unsupported** |
+| Claude Code (`claude --print`, stream-json) | stream-json input channel | native | native | **unsupported** |
+| Any MCP-consuming agent (Claude, Codex, OpenCode, Muse sessions) | `intercom-mcp` MCP tools | native | native (durable inbox claim) | **unsupported** |
 | Generic / synthetic | adapter contract | native | native | native |
 
-Only the first two are integrated. The other three rows record what was
-found while investigating their surfaces, not a claim of support.
+Every row above is backed by the live evidence in
+[docs/HARNESSES.md](HARNESSES.md): real binaries, real wire protocols,
+receipt trails, and — for Muse and Codex — a live steer that changed a
+running turn's output. Rows for harvardcodex and for MCP tools through
+the FreeInference backend record a provider-side limitation, not an
+Intercom one (see HARNESSES.md, "Provider failures are not harness
+failures").
 
 ## Why Muse can steer
 
@@ -96,6 +103,25 @@ A capability reported as unsupported always carries a limitation saying
 why. The adapter contract enforces this, so an adapter cannot advertise a
 capability it did not declare without an explanation.
 
+## Qualification levels
+
+Every capability is qualified at four independent levels:
+
+| Level | Meaning |
+|---|---|
+| advertised | the adapter's capability table declares the feature |
+| implemented | real harness code executes it (not a simulation) |
+| tested | automated tests exercise the real code path |
+| live-verified | observed working against the real harness binary, documented in `docs/HARNESSES.md` |
+
+Available means advertised AND implemented. Tested and live-verified
+describe evidence, never capability alone: one harness's verified steer
+does not make another harness able to steer. The Go node exposes the
+per-harness table via `protocol.HarnessQualificationMatrix()` and the
+extension hello response; Python adapters expose the same rows via
+`BaseHarness.qualifications()`, derived from their declared modes so
+they cannot drift from the capability table.
+
 ## How the matrix is enforced
 
 The recipient's advertised modes drive the delivery decision:
@@ -120,12 +146,19 @@ fall back to.
 | `IC-LOCAL` | yes | Local authenticated peer communication and delivery receipts |
 | `IC-DURABLE` | yes | Command deduplication, durable admission, event replay, crash recovery |
 | `IC-ACP` | yes | ACP v1 extension compatibility and capability negotiation |
-| `IC-REMOTE` | no | No cross-host transport; the profile requires one |
-| `IC-STEER` | Muse only | Verified through MSP `turn/steer` |
+| `IC-REMOTE` | mTLS loopback only | Two independent hosts over mTLS with pinned fingerprints, host-qualified ids, mutual enrollment, revocation/rotation. Non-loopback plaintext is impossible (TLS only). Live cross-host with real harnesses not qualified. |
+| `IC-STEER` | Muse, Codex | Verified live: MSP `turn/steer` (5/5 accepted during running echo turns) and Codex app-server `turn/steer` (steered instruction changed the turn's output). See HARNESSES.md. |
 
 Profiles are cumulative only where their prerequisites apply, and each
 implementation identifies its supported profiles individually. The
 supported set is reported by `_intercom/hello`.
+
+Principal isolation note: the daemon principal is the local Unix user.
+// All local clients sharing that user are one principal; they are NOT
+// strongly isolated agent principals. Per-agent isolation requires
+// separate agent credentials, which the daemon does not mint. Remote
+// sender identity is host-qualified ("hostId/sessionId") and grants are
+// checked against that qualified id on the receiving host.
 
 ## Adding a harness
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
 
 // HeartbeatInterval is how often a peer is expected to report liveness.

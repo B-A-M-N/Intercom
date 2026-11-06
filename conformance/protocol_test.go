@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/adapter"
-	"github.com/bamn/intercom/internal/adapter/acp"
-	"github.com/bamn/intercom/internal/config"
-	"github.com/bamn/intercom/internal/ids"
-	"github.com/bamn/intercom/internal/node"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/adapter"
+	"github.com/B-A-M-N/intercom/internal/adapter/acp"
+	"github.com/B-A-M-N/intercom/internal/config"
+	"github.com/B-A-M-N/intercom/internal/ids"
+	"github.com/B-A-M-N/intercom/internal/node"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // Test01_TwoAdaptersDiscover covers spec test 1: two different harness
@@ -58,15 +58,15 @@ func Test02_AuthorizedPeerSendsNotifies(t *testing.T) {
 		t.Fatalf("status = %q, want accepted", res.Status)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.notified) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.notifiedCount() == 1 })
 	if !ok {
-		t.Fatalf("recipient was not notified; notified=%d", len(e.bob.notified))
+		t.Fatalf("recipient was not notified; notified=%d", e.bob.notifiedCount())
 	}
-	if e.bob.notified[0].Body.Text != "hello bob" {
-		t.Errorf("notified text = %q", e.bob.notified[0].Body.Text)
+	if e.bob.notifiedMsg(0).Body.Text != "hello bob" {
+		t.Errorf("notified text = %q", e.bob.notifiedMsg(0).Body.Text)
 	}
-	if e.bob.notified[0].From != e.aliceID {
-		t.Errorf("notified message from = %q, want %q", e.bob.notified[0].From, e.aliceID)
+	if e.bob.notifiedMsg(0).From != e.aliceID {
+		t.Errorf("notified message from = %q, want %q", e.bob.notifiedMsg(0).From, e.aliceID)
 	}
 }
 
@@ -79,14 +79,14 @@ func Test03_QueueDoesNotAlterActiveTurn(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.delivered) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.deliveredCount() == 1 })
 	if !ok {
 		t.Fatal("recipient did not receive the queued message")
 	}
 	// Queueing must not inject into an active turn: the fake adapter records
 	// delivery but no notification handler ran.
-	if len(e.bob.notified) != 0 {
-		t.Errorf("queueing produced %d notifications, want 0", len(e.bob.notified))
+	if e.bob.notifiedCount() != 0 {
+		t.Errorf("queueing produced %d notifications, want 0", e.bob.notifiedCount())
 	}
 }
 
@@ -115,7 +115,7 @@ func Test04_SteeringSucceedsOnlyWhenSupported(t *testing.T) {
 		t.Fatalf("status = %q, want accepted", res.Status)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(steer.delivered) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return steer.deliveredCount() == 1 })
 	if !ok {
 		t.Fatal("steering harness did not receive the message")
 	}
@@ -177,8 +177,8 @@ func Test06_DuplicateCommandDoesNotDuplicateAdmission(t *testing.T) {
 
 	// The recipient must observe exactly one message.
 	time.Sleep(150 * time.Millisecond)
-	if len(e.bob.notified) != 1 {
-		t.Errorf("recipient saw %d notifications, want 1", len(e.bob.notified))
+	if e.bob.notifiedCount() != 1 {
+		t.Errorf("recipient saw %d notifications, want 1", e.bob.notifiedCount())
 	}
 }
 
@@ -431,23 +431,33 @@ func Test15_ProvenanceRetainedAcrossPrincipals(t *testing.T) {
 	if err := e.store.EnsurePrincipal(e.ctx, other, "other"); err != nil {
 		t.Fatalf("ensure principal: %v", err)
 	}
-	if err := e.store.GrantPermission(e.ctx, e.bobID, e.aliceID, store.RolePeer); err != nil {
+	// A cross-principal sender is its own session owned by the other
+	// principal, granted peer access to Alice. It must not claim Bob's
+	// session (which is owned by the node's principal).
+	otherSession := "ses_other00000000000000000000000"
+	if err := e.store.RegisterSession(e.ctx, protocol.PeerInfo{
+		SessionID: otherSession, Alias: "other", InstanceID: "ins_other00000000000000000000",
+		HostID: e.node.HostID(), PrincipalID: other, Harness: "synthetic",
+	}); err != nil {
+		t.Fatalf("register other session: %v", err)
+	}
+	if err := e.store.GrantPermission(e.ctx, otherSession, e.aliceID, store.RolePeer); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 
-	sender := node.Sender{PrincipalID: other, SessionID: e.bobID}
+	sender := node.Sender{PrincipalID: other, SessionID: otherSession}
 	res, err := e.send(sender, e.aliceID, "from another principal", "cmd_test000000000000000000000015", protocol.DeliveryNotify)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.alice.notified) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.alice.notifiedCount() == 1 })
 	if !ok {
 		t.Fatal("recipient was not notified")
 	}
-	got := e.alice.notified[0]
-	if got.From != e.bobID {
-		t.Errorf("sender session provenance lost: from=%q, want %q", got.From, e.bobID)
+	got := e.alice.notifiedMsg(0)
+	if got.From != otherSession {
+		t.Errorf("sender session provenance lost: from=%q, want %q", got.From, otherSession)
 	}
 
 	// The durable record must retain the sending principal separately.
@@ -466,9 +476,20 @@ func Test16_BackpressurePreventsUnboundedGrowth(t *testing.T) {
 	e := newEnv(t)
 	e.node.SetLimit(func(l *config.Limits) { l.MaxInboxMessages = 3 })
 
+	// Flood a registered session with no live adapter: its messages stay
+	// pending (unknown, claimable), so the inbox bound must engage.
+	// (Delivered messages are acknowledged and no longer pending.)
+	offline := "ses_offline00000000000000000000"
+	if err := e.node.RegisterAdapterSession(e.ctx, protocol.PeerInfo{
+		SessionID: offline, Alias: "offline", InstanceID: "ins_offline0000000000000000",
+		HostID: e.node.HostID(), PrincipalID: e.node.PrincipalID(), Harness: "synthetic",
+	}); err != nil {
+		t.Fatalf("register offline: %v", err)
+	}
+
 	var lastErr error
 	for i := 0; i < 10; i++ {
-		_, lastErr = e.send(e.aliceSender(), e.bobID, fmt.Sprintf("flood %d", i),
+		_, lastErr = e.send(e.aliceSender(), offline, fmt.Sprintf("flood %d", i),
 			fmt.Sprintf("cmd_flood%016d", i), protocol.DeliveryNotify)
 		if lastErr != nil {
 			break
@@ -612,29 +633,50 @@ func Test_AdapterCannotAdvertiseUnsupported(t *testing.T) {
 func Test_ExpiredMessagesAreNotInjected(t *testing.T) {
 	e := newEnv(t)
 
-	// A message with a deadline in the past must not be delivered.
-	res, err := e.node.Send(e.ctx, e.aliceSender(), node.SendRequest{
-		CommandID:  "cmd_test000000000000000000000018",
-		To:         e.bobID,
+	// Negative TTLs are rejected at ingress, so an already-expired message
+	// is admitted directly to the durable store to exercise the expiry
+	// path (as a pre-existing or clock-skewed record would present).
+	past := time.Now().UTC().Add(-time.Minute)
+	msg := protocol.Message{
+		MessageID: "msg_test000000000000000000000018", CommandID: "cmd_test000000000000000000000018",
+		From: e.aliceID, To: e.bobID,
 		Body:       protocol.MessageBody{Type: "text", Text: "stale"},
 		Delivery:   protocol.Delivery{Mode: protocol.DeliveryNotify, Wake: protocol.WakeNone, OnUnsupported: protocol.UnsupportedReject},
-		TTLSeconds: -60,
-	})
-	if err != nil {
-		t.Fatalf("send: %v", err)
+		CreatedAt:  past.Add(-time.Hour), ExpiresAt: &past,
 	}
+	fp, _ := store.Fingerprint("message/send", "expired")
+	cmdRec := store.CommandRecord{CommandID: msg.CommandID, PrincipalID: e.node.PrincipalID(), TargetSession: e.bobID, Operation: "message/send", State: protocol.CommandAccepted}
+	ev := protocol.EventEnvelope{EventID: "evt_test000000000000000000000018", SessionID: e.bobID, EventType: protocol.EventMessageAccepted, Timestamp: msg.CreatedAt, Payload: []byte("{}")}
+	if _, _, err := e.store.AdmitMessage(e.ctx, cmdRec, fp, msg, e.node.PrincipalID(), ev, store.AdmissionLimits{}); err != nil {
+		t.Fatalf("admit expired message: %v", err)
+	}
+	res := struct{ MessageID string }{MessageID: msg.MessageID}
+	_ = res
 
 	// The message is stored, but it is already expired, so the recipient must
-	// not receive it as a live delivery.
+	// not receive it as a live delivery. Expiry may be detected by the
+	// async delivery path or by Recover; either is correct, delivery is not.
 	report, err := e.node.Recover(e.ctx)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 	if report.Expired == 0 {
-		t.Error("expired message was not detected during recovery")
+		// Deliver may have voided it first; check for an expired receipt.
+		receipts, rerr := e.node.Receipts(e.ctx, res.MessageID)
+		expired := false
+		if rerr == nil {
+			for _, r := range receipts {
+				if r.Status == protocol.ReceiptExpired {
+					expired = true
+				}
+			}
+		}
+		if !expired {
+			t.Error("expired message was not detected during recovery or delivery")
+		}
 	}
-	if len(e.bob.notified) != 0 {
-		t.Errorf("expired message was delivered to the recipient: %d notifications", len(e.bob.notified))
+	if e.bob.notifiedCount() != 0 {
+		t.Errorf("expired message was delivered to the recipient: %d notifications", e.bob.notifiedCount())
 	}
 	_ = res
 }

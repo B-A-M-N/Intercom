@@ -20,7 +20,7 @@ section 12 forbids: a newly launched prompt is not active-turn steering.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .harness import (
     MODE_NOTIFY,
@@ -34,6 +34,7 @@ from .harness import (
     DeliveryResult,
     NotReady,
     SessionState,
+    UnsupportedOperation,
 )
 
 
@@ -45,17 +46,52 @@ class HermesAdapter(BaseHarness):
     """
 
     name = "hermes"
-    version = "0.1.0"
+    version = "0.2.0"
 
     #: ACP offers a prompt channel but no active-turn injection point.
     modes = (MODE_QUEUE, MODE_NOTIFY)
 
-    def __init__(self, acp_agent: Any = None, session_id: str = "") -> None:
+    def __init__(
+        self,
+        acp_agent: Any = None,
+        session_id: str = "",
+        session_starter: Optional[Callable[[str], str]] = None,
+    ) -> None:
         super().__init__()
         self._agent = acp_agent
         self._session_id = session_id
+        self._session_starter = session_starter
+        self._acp_sessions: dict[str, str] = {}
         self._states: dict[str, str] = {}
         self._notes: dict[str, list[str]] = {}
+
+    def acp_session(self, session_id: str) -> str:
+        """Return the ACP session id for an Intercom session id."""
+        mapped = self._acp_sessions.get(session_id) or self._lookup_mapping(session_id)
+        if mapped:
+            self._acp_sessions[session_id] = mapped
+            return mapped
+        if self._session_starter is None:
+            return session_id
+        try:
+            acp_session_id = self._session_starter(session_id)
+        except Exception as exc:
+            raise UnsupportedOperation(f"hermes session/new failed: {exc}") from exc
+        if not acp_session_id:
+            raise UnsupportedOperation("hermes session/new returned no session id")
+        self._acp_sessions[session_id] = acp_session_id
+        self._persist_mapping(session_id, acp_session_id)
+        return acp_session_id
+
+    def start(self) -> None:
+        start = getattr(self._agent, "start", None)
+        if callable(start):
+            start()
+
+    def close(self) -> None:
+        close = getattr(self._agent, "close", None)
+        if callable(close):
+            close()
 
     def bind_session(self, session_id: str) -> None:
         """Bind the adapter to the session it represents."""
@@ -93,7 +129,27 @@ class HermesAdapter(BaseHarness):
 
         text = _message_text(message)
         try:
-            self._call_acp("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]})
+            acp_session_id = self.acp_session(session_id)
+        except UnsupportedOperation as exc:
+            return DeliveryResult(status=RECEIPT_REJECTED, detail=str(exc))
+        try:
+            prompt = getattr(self._agent, "prompt", None)
+            if callable(prompt):
+                # ACPClient.prompt(session_id, text) submits and blocks
+                # until the turn completes. Legacy in-process agents use
+                # the keyword form bridged by _call_acp below.
+                try:
+                    prompt(acp_session_id, text)
+                except TypeError:
+                    self._call_acp(
+                        "session/prompt",
+                        {"sessionId": acp_session_id, "prompt": [{"type": "text", "text": text}]},
+                    )
+            else:
+                self._call_acp(
+                    "session/prompt",
+                    {"sessionId": acp_session_id, "prompt": [{"type": "text", "text": text}]},
+                )
         except NotReady as exc:
             return DeliveryResult(status=RECEIPT_UNKNOWN, detail=str(exc))
         except Exception as exc:
@@ -107,7 +163,11 @@ class HermesAdapter(BaseHarness):
     def notify(self, session_id: str, message: dict[str, Any]) -> DeliveryResult:
         """Record a notification without injecting it into the model's context."""
         text = _message_text(message)
-        self._notes.setdefault(session_id, []).append(text)
+        if not self._notify_durable(session_id, text, message):
+            return DeliveryResult(
+                status=RECEIPT_UNKNOWN,
+                detail="notification could not be durably persisted; not presented",
+            )
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
             detail="recorded in the adapter host's operator surface; not injected into the model context",
@@ -154,16 +214,10 @@ class HermesAdapter(BaseHarness):
 
 
 def _message_text(message: dict[str, Any]) -> str:
-    """Extract the text body from an Intercom message."""
-    body = message.get("body") or {}
-    if isinstance(body, dict):
-        text = body.get("text", "")
-        if text:
-            return str(text)
-        import json
+    """Extract labeled peer text (provenance enforced)."""
+    from .harness import render_peer_text
 
-        return json.dumps(body, separators=(",", ":"), sort_keys=True)
-    return str(body)
+    return render_peer_text(message)
 
 
 __all__ = ["HermesAdapter", "MODE_STEER"]

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/adapter/acp"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/transport"
+	"github.com/B-A-M-N/intercom/internal/adapter/acp"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/transport"
 )
 
 // Test_PythonAdapterHostBridgesToCore is the polyglot boundary test.
@@ -36,7 +36,7 @@ func Test_PythonAdapterHostBridgesToCore(t *testing.T) {
 	e := newEnv(t)
 
 	// Start a real Go host on a real socket.
-	socketPath := filepath.Join(t.TempDir(), "intercom.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "intercom.sock")
 	hostCtx, cancelHost := context.WithCancel(context.Background())
 	defer cancelHost()
 

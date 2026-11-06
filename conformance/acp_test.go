@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/adapter/acp"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/transport"
+	"github.com/B-A-M-N/intercom/internal/adapter/acp"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/transport"
 )
 
 // rpcClient is a minimal JSON-RPC client over the local transport.
@@ -311,7 +311,7 @@ func Test_ACPStandardClientRemainsOperational(t *testing.T) {
 func Test_TransportCarriesJSONRPC(t *testing.T) {
 	e := newEnv(t)
 
-	ln, err := transport.ListenUnix(e.ctx, t.TempDir()+"/t.sock")
+	ln, err := transport.ListenUnix(e.ctx, shortSocketDir(t)+"/t.sock")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}

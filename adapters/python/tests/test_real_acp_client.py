@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -44,31 +47,24 @@ class TestRealACPClient(unittest.TestCase):
         # The Intercom ACP server must be built before the test can run it.
         cls.binary = Path(REPO) / ".testbin" / "intercom-acp"
         cls.binary.parent.mkdir(exist_ok=True)
-        build = subprocess.run(
-            [
-                "go", "build", "-buildvcs=false",
-                "-o", str(cls.binary),
-                "./cmd/intercom-acp",
-            ],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            env={
-                **os.environ,
-                "GOCACHE": "/tmp/gocache",
-                "GOFLAGS": "-mod=mod",
-                "GOPROXY": "off",
-                "GOSUMDB": "off",
-            },
-        )
-        if build.returncode != 0:
-            raise unittest.SkipTest(f"could not build intercom-acp: {build.stderr}")
+        for name, pkg in [("intercom-acp", "./cmd/intercom-acp"), ("intercomd", "./cmd/intercomd")]:
+            out_bin = cls.binary.parent / name
+            build = subprocess.run(
+                ["go", "build", "-buildvcs=false", "-o", str(out_bin), pkg],
+                cwd=REPO, capture_output=True, text=True,
+                env={**os.environ, "GOCACHE": "/tmp/gocache", "GOFLAGS": "-mod=mod", "GOPROXY": "off", "GOSUMDB": "off"},
+                timeout=300,
+            )
+            if build.returncode != 0:
+                raise unittest.SkipTest(f"could not build {name}: {build.stderr}")
+        cls.daemon = cls.binary.parent / "intercomd"
 
     def _run_client(self, script: str) -> str:
         """Run a script against the Intercom ACP server and return stdout."""
         env = dict(os.environ)
         env["PYTHONPATH"] = self.acp_path + os.pathsep + env.get("PYTHONPATH", "")
         env["INTERCOM_ACP_BINARY"] = str(self.binary)
+        env["INTERCOM_DAEMON_SOCKET"] = self.daemon_socket
 
         result = subprocess.run(
             [sys.executable, "-c", script],
@@ -83,6 +79,27 @@ class TestRealACPClient(unittest.TestCase):
 
     def test_real_client_negotiates_and_calls_the_extension(self) -> None:
         """A real ACP client initializes and reaches the Intercom methods."""
+        # intercom-acp is a thin client: intercomd must be running and own
+        # the durable store. Start it on a short socket path.
+        tmp = tempfile.mkdtemp(prefix="iacp-", dir="/tmp")
+        self.daemon_socket = f"{tmp}/i.sock"
+        daemon = subprocess.Popen(
+            [str(self.daemon), "--socket", self.daemon_socket, "--data-dir", f"{tmp}/data",
+             "--alias", "acp-test", "--principal", "prn_acptest00000000000000000000"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: (daemon.kill(), daemon.wait()))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1.0)
+                    sock.connect(self.daemon_socket)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            self.fail("intercomd did not start")
         script = r'''
 import asyncio, json, os, sys
 
@@ -129,8 +146,7 @@ async def main():
     binary = os.environ["INTERCOM_ACP_BINARY"]
     proc = await asyncio.create_subprocess_exec(
         binary,
-        "--socket", "/tmp/intercom-acp-test.sock",
-        "--data-dir", "/tmp/intercom-acp-test-data",
+        "--socket", os.environ["INTERCOM_DAEMON_SOCKET"],
         "--session", "ses_realtest000000000000000000",
         "--alias", "real-client-test",
         "--harness", "hermes",

@@ -3,9 +3,10 @@ package node
 import (
 	"context"
 	"errors"
+	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // PermissionRecord is one resolved peer-to-owner authorization.
@@ -44,11 +45,33 @@ func (n *Node) GrantPermission(ctx context.Context, actor Sender, ownerSession, 
 			"session %q does not hold owner authority over %q", actor.SessionID, ownerSession)
 	}
 
-	if err := n.store.GrantPermission(ctx, peerSession, ownerSession, role); err != nil {
+	return n.GrantPermissionWithExpiry(ctx, actor, ownerSession, peerSession, role, time.Time{})
+}
+
+// GrantPermissionWithExpiry grants access until expires (zero = no expiry).
+func (n *Node) GrantPermissionWithExpiry(ctx context.Context, actor Sender, ownerSession, peerSession string, role store.Role, expires time.Time) error {
+	if role != store.RolePeer && role != store.RoleOwner {
+		return protocol.Errorf(protocol.CodeInvalidParams, "invalid role %q", role)
+	}
+	if ownerSession == "" || peerSession == "" {
+		return protocol.Errorf(protocol.CodeInvalidParams, "ownerSession and peerSession are required")
+	}
+	allowed, err := n.holdsOwnerAuthority(ctx, actor, ownerSession)
+	if err != nil {
 		return err
 	}
-	return n.store.Audit(ctx, actor.PrincipalID, peerSession, "permission.granted",
-		string(role)+" over "+ownerSession)
+	if !allowed {
+		return protocol.Errorf(protocol.CodeForbidden,
+			"session %q does not hold owner authority over %q", actor.SessionID, ownerSession)
+	}
+	if err := n.store.GrantPermissionWithExpiry(ctx, peerSession, ownerSession, role, expires); err != nil {
+		return err
+	}
+	detail := string(role) + " over " + ownerSession
+	if !expires.IsZero() {
+		detail += " until " + expires.UTC().Format(store.TimestampLayout)
+	}
+	return n.store.Audit(ctx, actor.PrincipalID, peerSession, "permission.granted", detail)
 }
 
 // RevokePermission revokes a peer's access to an owner's session.

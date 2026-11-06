@@ -16,10 +16,13 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
-	"github.com/bamn/intercom/internal/node"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/node"
+	"github.com/B-A-M-N/intercom/internal/remote"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/routing"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // ProtocolVersion is the ACP protocol version this extension targets.
@@ -33,9 +36,48 @@ type Server struct {
 	peerSession string
 	// peerPrincipal is the principal established by the transport.
 	peerPrincipal string
+	// delegationRole is "owner" for registered connections and "attached"
+	// for scoped MCP clients. Empty means owner (legacy direct callers).
+	delegationRole string
+	// delegationToken is the scoped token for attached connections. It is
+	// re-verified on every request so expiry/revocation apply to live
+	// connections, not just at attach time.
+	delegationToken string
 	// emit sends a server-initiated notification to the connected client.
 	// It is nil when the server is used without a transport.
 	emit func(ctx context.Context, method string, params any)
+}
+
+// SetDelegation marks this server's connection role. Attached connections
+// get a strict method allowlist and per-request delegation re-verification.
+func (s *Server) SetDelegation(role, token string) {
+	s.delegationRole = role
+	s.delegationToken = token
+}
+
+// attachedAllowlist is the strict method set for scope=mcp clients.
+// Notably absent: session/register, session/delegate, session/attach,
+// permission/*, conversation/create|close, remote/*.
+var attachedAllowlist = map[string]bool{
+	"initialize": true,
+	protocol.MethodHello: true,
+	protocol.MethodPeerList: true,
+	protocol.MethodPeerResolve: true,
+	protocol.MethodPeerCapabilities: true,
+	protocol.MethodPeerPresence: true,
+	protocol.MethodPeerRoute: true,
+	protocol.MethodConversationHistory: true,
+	protocol.MethodMessageSend: true,
+	protocol.MethodMessageStatus: true,
+	protocol.MethodMessageReply: true,
+	protocol.MethodSessionState: true,
+	protocol.MethodSessionSnapshot: true,
+	protocol.MethodSessionReplay: true,
+	protocol.MethodSessionSubscribe: true,
+	protocol.MethodMessageListPending: true,
+	protocol.MethodMessageReport: true,
+	protocol.MethodMessageRenew: true,
+	protocol.MethodHeartbeat: true,
 }
 
 // NewServer creates an ACP extension server bound to a node.
@@ -76,20 +118,20 @@ type HelloResult struct {
 	Prefix       string                `json:"prefix"`
 	Capabilities []protocol.Capability `json:"capabilities"`
 	Profiles     []string              `json:"profiles"`
+	Qualifications []protocol.CapabilityQualification `json:"qualifications,omitempty"`
 	Meta         map[string]any        `json:"_meta,omitempty"`
 }
 
 // Capability advertisement for the ACP agent capabilities block.
 //
-// The Intercom extension is advertised through _meta so that an ordinary ACP
-// client ignores it entirely.
+// This endpoint is an Intercom extension/control-plane participant, not a
+// complete ACP agent: it does not implement session/new, session/load, or
+// session/prompt. It must not advertise capabilities it does not have.
 func (s *Server) initializeResult() InitializeResult {
 	return InitializeResult{
 		ProtocolVersion: ProtocolVersion,
 		AgentCapabilities: map[string]any{
-			"loadSession":         true,
-			"promptCapabilities":  map[string]any{},
-			"sessionCapabilities": map[string]any{},
+			"loadSession": false,
 		},
 		AgentInfo: map[string]any{
 			"name":    "intercom",
@@ -102,6 +144,7 @@ func (s *Server) initializeResult() InitializeResult {
 				"specRevision": protocol.SpecRevision,
 				"namespace":    protocol.ExtensionNamespace,
 				"prefix":       protocol.ExtensionPrefix,
+				"role":         "extension/control-plane participant; standard ACP session lifecycle is not implemented",
 			},
 		},
 	}
@@ -131,19 +174,46 @@ func (s *Server) HandleValue(ctx context.Context, method string, params any) (an
 
 // handle performs the dispatch.
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *protocol.RPCError) {
+	if s.delegationRole == "attached" {
+		if s.peerSession == "" || s.delegationToken == "" {
+			return nil, protocol.Errorf(protocol.CodeForbidden, "attached client has no delegation")
+		}
+		if _, err := s.n.VerifyDelegationDetailed(ctx, s.peerSession, s.delegationToken); err != nil {
+			return nil, protocol.Errorf(protocol.CodeForbidden, "delegation expired, revoked, or superseded")
+		}
+		if !attachedAllowlist[method] {
+			return nil, protocol.Errorf(protocol.CodeForbidden, "attached MCP client (scope=mcp) may not invoke %q", method)
+		}
+	}
 	switch method {
 	case "initialize":
 		return s.initializeResult(), nil
 	case protocol.MethodHello:
 		return s.hello(ctx, params)
 	case protocol.MethodPeerList:
-		return s.peerList(ctx)
+		return s.peerList(ctx, params)
 	case protocol.MethodPeerResolve:
 		return s.peerResolve(ctx, params)
 	case protocol.MethodPeerCapabilities:
 		return s.peerCapabilities(ctx, params)
 	case protocol.MethodPeerPresence:
 		return s.peerPresence(ctx, params)
+	case protocol.MethodPeerRoute:
+		return s.peerRoute(ctx, params)
+	case protocol.MethodConversationCreate:
+		return s.conversationCreate(ctx, params)
+	case protocol.MethodConversationHistory:
+		return s.conversationHistory(ctx, params)
+	case protocol.MethodConversationClose:
+		return s.conversationClose(ctx, params)
+	case protocol.MethodRemoteEnroll:
+		return s.remoteEnroll(ctx, params)
+	case protocol.MethodRemoteList:
+		return s.remoteList(ctx, params)
+	case protocol.MethodRemoteSend:
+		return s.remoteSend(ctx, params)
+	case protocol.MethodRemoteStatus:
+		return s.remoteStatus(ctx, params)
 	case protocol.MethodMessageSend:
 		return s.messageSend(ctx, params)
 	case protocol.MethodMessageReply:
@@ -160,10 +230,16 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		return s.sessionSubscribe(ctx, params)
 	case protocol.MethodSessionRegister:
 		return s.sessionRegister(ctx, params)
+	case protocol.MethodSessionDelegation:
+		return s.sessionDelegate(ctx, params)
+	case protocol.MethodSessionAttach:
+		return s.sessionAttach(ctx, params)
 	case protocol.MethodMessageListPending:
 		return s.messageListPending(ctx, params)
 	case protocol.MethodMessageReport:
 		return s.messageReport(ctx, params)
+	case protocol.MethodMessageRenew:
+		return s.messageRenew(ctx, params)
 	case protocol.MethodHeartbeat:
 		return s.heartbeat(ctx, params)
 	case protocol.MethodPermissionGrant:
@@ -258,26 +334,41 @@ func (s *Server) helloResult(advertised []protocol.Capability) HelloResult {
 		Prefix:       protocol.ExtensionPrefix,
 		Capabilities: advertised,
 		Profiles:     s.n.SupportedProfiles(),
+		Qualifications: protocol.HarnessQualificationMatrix(),
 	}
 }
 
 // PeerListParams are the parameters of _intercom/peer/list.
 type PeerListParams struct {
-	Limit int `json:"limit,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
 }
 
 // PeerListResult is the response to _intercom/peer/list.
 type PeerListResult struct {
-	Peers []protocol.PeerInfo `json:"peers"`
+	Peers      []protocol.PeerInfo `json:"peers"`
+	NextCursor string              `json:"nextCursor,omitempty"`
+	HasMore    bool                `json:"hasMore,omitempty"`
 }
 
-// peerList discovers visible peers.
-func (s *Server) peerList(ctx context.Context) (any, *protocol.RPCError) {
-	peers, err := s.n.Discover(ctx)
-	if err != nil {
-		return nil, protocol.Errorf(protocol.CodeInternalError, "discovery failed: %v", err)
+// peerList discovers visible peers with cursor pagination.
+func (s *Server) peerList(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p PeerListParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
 	}
-	return PeerListResult{Peers: peers}, nil
+	peers, next, err := s.n.DiscoverForPage(ctx, s.sender(), p.Limit, p.Cursor)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	// Probe hasMore without leaking: ask for one more visible peer.
+	more := false
+	if next != "" {
+		if extra, _, err := s.n.DiscoverForPage(ctx, s.sender(), 1, next); err == nil && len(extra) > 0 {
+			more = true
+		}
+	}
+	return PeerListResult{Peers: peers, NextCursor: next, HasMore: more}, nil
 }
 
 // PeerResolveParams are the parameters of _intercom/peer/resolve.
@@ -304,12 +395,12 @@ func (s *Server) peerResolve(ctx context.Context, params json.RawMessage) (any, 
 	if target == "" {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "alias or sessionId is required")
 	}
-	peer, err := s.n.Resolve(ctx, target)
+	peer, err := s.n.ResolveFor(ctx, s.sender(), target)
 	if err != nil {
 		if errors.Is(err, node.ErrNotFound) {
 			return nil, protocol.Errorf(protocol.CodeInvalidParams, "no session resolves from %q", target)
 		}
-		return nil, protocol.Errorf(protocol.CodeInternalError, "resolve failed: %v", err)
+		return nil, toRPCError(err)
 	}
 	return PeerResolveResult{Peer: peer}, nil
 }
@@ -330,6 +421,9 @@ func (s *Server) peerCapabilities(ctx context.Context, params json.RawMessage) (
 	var p PeerCapabilitiesParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
+	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
 	}
 	caps, err := s.n.Capabilities(ctx, p.Session)
 	if err != nil {
@@ -355,11 +449,231 @@ func (s *Server) peerPresence(ctx context.Context, params json.RawMessage) (any,
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
+	}
 	presence, err := s.n.Presence(ctx, p.Session)
 	if err != nil {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown session %q", p.Session)
 	}
 	return PeerPresenceResult{SessionID: p.Session, Presence: presence}, nil
+}
+
+// PeerRouteParams are the parameters of _intercom/peer/route.
+type PeerRouteParams struct {
+	Target       string `json:"target,omitempty"`
+	Harness      string `json:"harness,omitempty"`
+	Capability   string `json:"capability,omitempty"`
+	Availability string `json:"availability,omitempty"`
+}
+
+// PeerRouteResult is the response to _intercom/peer/route.
+type PeerRouteResult struct {
+	TargetSession string `json:"targetSession"`
+	Via           string `json:"via"`
+	Explain       string `json:"explain"`
+}
+
+// peerRoute returns an explainable deterministic routing decision.
+func (s *Server) peerRoute(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p PeerRouteParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	var sel *routing.Selector
+	if p.Harness != "" || p.Capability != "" || p.Availability != "" {
+		sel = &routing.Selector{Harness: p.Harness, Capability: protocol.CapabilityID(p.Capability), Availability: protocol.PresenceState(p.Availability)}
+	}
+	route, err := s.n.Route(ctx, s.sender(), p.Target, sel)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return PeerRouteResult{TargetSession: route.TargetSession, Via: route.Via, Explain: route.Explain}, nil
+}
+
+// ConversationCreateParams are the parameters of _intercom/conversation/create.
+type ConversationCreateParams struct {
+	ID           string   `json:"conversationId,omitempty"`
+	Participants []string `json:"participants"`
+	Title        string   `json:"title,omitempty"`
+}
+
+// ConversationCreateResult is the response to conversation/create.
+type ConversationCreateResult struct {
+	ConversationID string `json:"conversationId"`
+	Status         string `json:"status"`
+}
+
+func (s *Server) conversationCreate(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p ConversationCreateParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if len(p.Participants) == 0 {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "participants are required")
+	}
+	conv, err := s.n.CreateConversation(ctx, s.sender(), p.ID, p.Participants, p.Title)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return ConversationCreateResult{ConversationID: conv.ID, Status: conv.Status}, nil
+}
+
+// ConversationHistoryParams are the parameters of _intercom/conversation/history.
+type ConversationHistoryParams struct {
+	ConversationID string `json:"conversationId"`
+	Limit          int    `json:"limit,omitempty"`
+	Cursor         string `json:"cursor,omitempty"`
+}
+
+// ConversationHistoryResult is the response to conversation/history.
+type ConversationHistoryResult struct {
+	ConversationID string             `json:"conversationId"`
+	Messages       []protocol.Message `json:"messages"`
+	NextCursor     string             `json:"nextCursor,omitempty"`
+	HasMore        bool               `json:"hasMore,omitempty"`
+}
+
+func (s *Server) conversationHistory(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p ConversationHistoryParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	msgs, err := s.n.ConversationHistoryPage(ctx, s.sender(), p.ConversationID, p.Limit, p.Cursor)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	next := ""
+	if len(msgs) > 0 {
+		next = msgs[len(msgs)-1].MessageID
+	}
+	more := false
+	if next != "" {
+		if extra, err := s.n.ConversationHistoryPage(ctx, s.sender(), p.ConversationID, 1, next); err == nil && len(extra) > 0 {
+			more = true
+		}
+	}
+	return ConversationHistoryResult{ConversationID: p.ConversationID, Messages: msgs, NextCursor: next, HasMore: more}, nil
+}
+
+// ConversationCloseParams are the parameters of _intercom/conversation/close.
+type ConversationCloseParams struct {
+	ConversationID string `json:"conversationId"`
+}
+
+func (s *Server) conversationClose(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p ConversationCloseParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := s.n.CloseConversation(ctx, s.sender(), p.ConversationID); err != nil {
+		return nil, toRPCError(err)
+	}
+	return map[string]any{"conversationId": p.ConversationID, "status": "closed"}, nil
+}
+
+// RemoteEnrollParams enrolls a remote host. Fingerprint is the pinned
+// TLS identity; no bearer secrets are accepted or logged.
+type RemoteEnrollParams struct {
+	HostID      string `json:"hostId"`
+	Endpoint    string `json:"endpoint"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+func (s *Server) remoteEnroll(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p RemoteEnrollParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.HostID == "" || p.Endpoint == "" || p.Fingerprint == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "hostId, endpoint and fingerprint are required")
+	}
+	// Owner/operator check: only the local operator may enroll hosts.
+	if err := s.n.AuthorizeRemoteAdmin(ctx, s.sender()); err != nil {
+		return nil, toRPCError(err)
+	}
+	// Strict enrollment: TLS handshake + pinned fingerprint + hostId
+	// must all verify; any other response fails.
+	if _, err := remote.Enroll(ctx, p.Endpoint, s.n.RemoteIdentity(), p.HostID, p.Fingerprint); err != nil {
+		return nil, protocol.Errorf(protocol.CodeInternalError, "remote enroll failed: %v", err)
+	}
+	if err := s.n.Store().EnrollHost(ctx, p.HostID, p.Endpoint, p.Fingerprint); err != nil {
+		return nil, toRPCError(err)
+	}
+	_ = s.n.Store().Audit(ctx, s.sender().PrincipalID, p.HostID, "remote.enrolled", p.Endpoint)
+	return map[string]any{"hostId": p.HostID, "endpoint": p.Endpoint, "trust": "trusted"}, nil
+}
+
+func (s *Server) remoteList(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	if err := s.n.AuthorizeRemoteAdmin(ctx, s.sender()); err != nil {
+		return nil, toRPCError(err)
+	}
+	hosts, err := s.n.Store().ListRemoteHosts(ctx)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return hosts, nil
+}
+
+// RemoteSendParams sends to a remote host session.
+type RemoteSendParams struct {
+	RemoteHost    string `json:"remoteHost"`
+	TargetSession string `json:"targetSession"`
+	CommandID     string `json:"commandId"`
+	Text          string `json:"text"`
+	Mode          string `json:"mode,omitempty"`
+	CorrelationID string `json:"correlationId,omitempty"`
+	TTLSeconds    int    `json:"ttlSeconds,omitempty"`
+}
+
+func (s *Server) remoteSend(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p RemoteSendParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	mode := protocol.DeliveryMode(p.Mode)
+	if mode == "" {
+		mode = protocol.DeliveryNotify
+	}
+	result, err := s.n.SendRemote(ctx, s.sender(), node.RemoteSendRequest{
+		RemoteHost: p.RemoteHost, TargetSession: p.TargetSession, CommandID: p.CommandID,
+		Body: protocol.MessageBody{Type: "text", Text: p.Text}, Mode: mode,
+		CorrelationID: p.CorrelationID, TTLSeconds: p.TTLSeconds,
+	})
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return result, nil
+}
+
+// RemoteStatusParams checks outbound transfer status.
+type RemoteStatusParams struct {
+	MessageID string `json:"messageId"`
+}
+
+func (s *Server) remoteStatus(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p RemoteStatusParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	// Per-transfer ownership: only the original sender session (or
+	// same-principal operator) may read its status.
+	if err := s.n.AuthorizeRemoteAdmin(ctx, s.sender()); err != nil {
+		// Non-operator fallback: check exact sender session.
+		transfer, err := s.n.Store().GetRemoteTransfer(ctx, p.MessageID)
+		if err != nil {
+			return nil, toRPCError(err)
+		}
+		if transfer.SenderSession != s.sender().SessionID {
+			return nil, toRPCError(protocol.Errorf(protocol.CodeForbidden, "transfer belongs to another sender"))
+		}
+		return transfer, nil
+	}
+	transfer, err := s.n.Store().GetRemoteTransfer(ctx, p.MessageID)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return transfer, nil
 }
 
 // MessageSendParams are the parameters of _intercom/message/send.
@@ -370,6 +684,7 @@ type MessageSendParams struct {
 	Delivery      protocol.Delivery    `json:"delivery"`
 	ReplyTo       string               `json:"replyTo,omitempty"`
 	CorrelationID string               `json:"correlationId,omitempty"`
+	ConversationID string              `json:"conversationId,omitempty"`
 	TTLSeconds    int                  `json:"ttlSeconds,omitempty"`
 	Metadata      map[string]any       `json:"metadata,omitempty"`
 }
@@ -402,6 +717,7 @@ func (s *Server) messageSend(ctx context.Context, params json.RawMessage) (any, 
 		Delivery:      p.Delivery,
 		ReplyTo:       p.ReplyTo,
 		CorrelationID: p.CorrelationID,
+		ConversationID: p.ConversationID,
 		TTLSeconds:    p.TTLSeconds,
 		Metadata:      p.Metadata,
 	})
@@ -432,7 +748,7 @@ func (s *Server) messageReply(ctx context.Context, params json.RawMessage) (any,
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
-	res, err := s.n.Reply(ctx, s.sender(), p.MessageID, p.Text, p.CorrelationID)
+	res, err := s.n.ReplyWithCommandID(ctx, s.sender(), p.MessageID, p.Text, p.CorrelationID, p.CommandID)
 	if err != nil {
 		return nil, toRPCError(err)
 	}
@@ -457,9 +773,9 @@ func (s *Server) messageStatus(ctx context.Context, params json.RawMessage) (any
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
-	receipts, err := s.n.Receipts(ctx, p.MessageID)
+	receipts, err := s.n.MessageStatusFor(ctx, s.sender(), p.MessageID)
 	if err != nil {
-		return nil, protocol.Errorf(protocol.CodeInternalError, "receipt read failed: %v", err)
+		return nil, toRPCError(err)
 	}
 	if len(receipts) == 0 {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "unknown messageId %q", p.MessageID)
@@ -493,6 +809,9 @@ func (s *Server) sessionState(ctx context.Context, params json.RawMessage) (any,
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
+	}
 	snap, err := s.n.SessionState(ctx, p.Session)
 	if err != nil {
 		return nil, toRPCError(err)
@@ -516,6 +835,9 @@ func (s *Server) sessionSnapshot(ctx context.Context, params json.RawMessage) (a
 	var p SessionStateParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
+	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
 	}
 	snap, err := s.n.Snapshot(ctx, p.Session)
 	if err != nil {
@@ -549,6 +871,9 @@ func (s *Server) sessionReplay(ctx context.Context, params json.RawMessage) (any
 	var p SessionReplayParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
+	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
 	}
 	res, err := s.n.Replay(ctx, p.Session, p.Cursor, p.Limit)
 	if err != nil {
@@ -604,6 +929,9 @@ func (s *Server) sessionSubscribe(ctx context.Context, params json.RawMessage) (
 	if p.Session == "" {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
 	}
+	if err := s.n.AuthorizeObserve(ctx, s.sender(), p.Session); err != nil {
+		return nil, toRPCError(err)
+	}
 
 	ch, err := s.n.Subscribe(ctx, p.Session)
 	if err != nil {
@@ -650,14 +978,23 @@ type sessionRegisterParams struct {
 	Version       string                  `json:"harnessVersion,omitempty"`
 	HostID        string                  `json:"hostId,omitempty"`
 	PrincipalID   string                  `json:"principalId,omitempty"`
+	TrustDomain   string                  `json:"trustDomain,omitempty"`
+	Tags          []string                `json:"tags,omitempty"`
 	Capabilities  []protocol.Capability   `json:"capabilities"`
 	DeliveryModes []protocol.DeliveryMode `json:"deliveryModes"`
+	// SessionSecret is the client-held resume credential. Required to
+	// resume an existing session; issued (once) on first creation.
+	SessionSecret string `json:"sessionSecret,omitempty"`
 }
 
 // sessionRegisterResult is the response to _intercom/session/register.
 type sessionRegisterResult struct {
-	SessionID  string `json:"sessionId"`
+	SessionID string `json:"sessionId"`
 	Registered bool   `json:"registered"`
+	// SessionSecret is present only on first creation when the client
+	// did not supply one. The client must persist it; resume without
+	// it is forbidden.
+	SessionSecret string `json:"sessionSecret,omitempty"`
 }
 
 // sessionRegister records an out-of-process adapter's session.
@@ -665,6 +1002,45 @@ type sessionRegisterResult struct {
 // The adapter's capability claims are stored as given. The core does not
 // upgrade them, and an adapter that claims a capability it cannot implement
 // is caught by the conformance tests rather than by the core guessing.
+// sessionDelegate mints a scoped attached-client token for the bound session.
+func (s *Server) sessionDelegate(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p struct {
+		Session string `json:"sessionId"`
+	}
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	token, err := s.n.IssueDelegationFor(ctx, s.sender(), p.Session)
+	if err != nil {
+		return nil, toRPCError(err)
+	}
+	return map[string]any{"delegationToken": token, "sessionId": p.Session, "scope": "mcp"}, nil
+}
+
+// sessionAttach verifies a delegation token and binds this connection as an
+// attached client. It MUST NOT update instance identity, capabilities, or
+// delivery modes - those belong to the owning registration.
+func (s *Server) sessionAttach(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p struct {
+		Session string `json:"sessionId"`
+		Token   string `json:"delegationToken"`
+	}
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if p.Session == "" || p.Token == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId and delegationToken are required")
+	}
+	// Ensure the session exists (no registration side effect).
+	if _, err := s.n.Store().GetSession(ctx, p.Session); err != nil {
+		return nil, toRPCError(err)
+	}
+	if err := s.n.VerifyDelegationFor(ctx, p.Session, p.Token); err != nil {
+		return nil, toRPCError(err)
+	}
+	return map[string]any{"attached": true, "sessionId": p.Session}, nil
+}
+
 func (s *Server) sessionRegister(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
 	var p sessionRegisterParams
 	if err := decodeParams(params, &p); err != nil {
@@ -677,22 +1053,33 @@ func (s *Server) sessionRegister(ctx context.Context, params json.RawMessage) (a
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "instanceId is required")
 	}
 
+	// Client-supplied principalId/hostId are never authentication evidence.
+	// Identity comes from the authenticated transport/server binding; the
+	// store rejects resume under a different principal and requires the
+	// client-held session secret for resume (same UID is not enough).
 	peer := protocol.PeerInfo{
 		SessionID:      p.SessionID,
 		InstanceID:     p.InstanceID,
 		Alias:          p.Alias,
 		Harness:        p.Harness,
 		HarnessVersion: p.Version,
-		HostID:         p.HostID,
-		PrincipalID:    p.PrincipalID,
+		HostID:         s.n.HostID(),
+		PrincipalID:    s.peerPrincipal,
 		Capabilities:   p.Capabilities,
 		Delivery:       p.DeliveryModes,
 		Presence:       protocol.PresenceOnline,
+		TrustDomain:    "local:" + s.n.HostID(),
+		Tags:           p.Tags,
+		SessionSecret:  p.SessionSecret,
 	}
-	if err := s.n.RegisterAdapterSession(ctx, peer); err != nil {
+	if s.peerPrincipal == "" {
+		peer.PrincipalID = s.n.PrincipalID()
+	}
+	issued, err := s.n.RegisterAdapterSessionWithSecret(ctx, peer)
+	if err != nil {
 		return nil, toRPCError(err)
 	}
-	return sessionRegisterResult{SessionID: p.SessionID, Registered: true}, nil
+	return sessionRegisterResult{SessionID: p.SessionID, Registered: true, SessionSecret: issued}, nil
 }
 
 // messageListPendingParams are the parameters of _intercom/message/listPending.
@@ -715,7 +1102,7 @@ func (s *Server) messageListPending(ctx context.Context, params json.RawMessage)
 	if p.Session == "" {
 		return nil, protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
 	}
-	msgs, err := s.n.PendingInbox(ctx, p.Session, p.Limit)
+	msgs, err := s.n.PendingInboxFor(ctx, s.sender(), p.Session, p.Limit)
 	if err != nil {
 		return nil, toRPCError(err)
 	}
@@ -724,9 +1111,11 @@ func (s *Server) messageListPending(ctx context.Context, params json.RawMessage)
 
 // messageReportParams are the parameters of _intercom/message/report.
 type messageReportParams struct {
-	MessageID string                 `json:"messageId"`
-	Status    protocol.ReceiptStatus `json:"status"`
-	Detail    string                 `json:"detail,omitempty"`
+	MessageID       string                 `json:"messageId"`
+	Status          protocol.ReceiptStatus `json:"status"`
+	Detail          string                 `json:"detail,omitempty"`
+	ClaimToken      string                 `json:"claimToken,omitempty"`
+	ClaimGeneration int64                  `json:"claimGeneration,omitempty"`
 }
 
 // messageReportResult is the response to _intercom/message/report.
@@ -741,10 +1130,29 @@ func (s *Server) messageReport(ctx context.Context, params json.RawMessage) (any
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
-	if err := s.n.ReportDelivery(ctx, p.MessageID, p.Status, p.Detail); err != nil {
+	if err := s.n.ReportDeliveryFor(ctx, s.sender(), p.MessageID, p.Status, p.Detail, p.ClaimToken, p.ClaimGeneration); err != nil {
 		return nil, toRPCError(err)
 	}
 	return messageReportResult{MessageID: p.MessageID, Status: p.Status}, nil
+}
+
+// messageRenewParams are the parameters of _intercom/message/renew.
+type messageRenewParams struct {
+	MessageID       string `json:"messageId"`
+	ClaimToken      string `json:"claimToken,omitempty"`
+	ClaimGeneration int64  `json:"claimGeneration,omitempty"`
+}
+
+// messageRenew extends the caller's claim lease for a long harness operation.
+func (s *Server) messageRenew(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
+	var p messageRenewParams
+	if err := decodeParams(params, &p); err != nil {
+		return nil, err
+	}
+	if err := s.n.RenewClaimFor(ctx, s.sender(), p.MessageID, p.ClaimToken, p.ClaimGeneration); err != nil {
+		return nil, toRPCError(err)
+	}
+	return map[string]any{"messageId": p.MessageID, "renewed": true}, nil
 }
 
 // HeartbeatParams are the parameters of _intercom/heartbeat.
@@ -768,9 +1176,14 @@ func (s *Server) heartbeat(ctx context.Context, params json.RawMessage) (any, *p
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
-	session := p.Session
+	// A heartbeat may only report the caller's own session. A supplied
+	// sessionId is ignored: it is not authentication evidence.
+	session := s.peerSession
 	if session == "" {
-		session = s.peerSession
+		return nil, protocol.Errorf(protocol.CodeUnauthorized, "the caller has no bound session")
+	}
+	if err := s.n.AuthorizeOwn(ctx, s.sender(), session); err != nil {
+		return nil, toRPCError(err)
 	}
 	if err := s.n.Heartbeat(ctx, session); err != nil {
 		return nil, toRPCError(err)
@@ -787,6 +1200,10 @@ type PermissionGrantParams struct {
 	OwnerSession string `json:"ownerSession"`
 	PeerSession  string `json:"peerSession"`
 	Role         string `json:"role"`
+	// ExpiresAt is an optional RFC3339 expiry; empty means no expiry.
+	ExpiresAt string `json:"expiresAt,omitempty"`
+	// TTLSeconds is an alternative expiry expressed as seconds from now.
+	TTLSeconds int `json:"ttlSeconds,omitempty"`
 }
 
 // PermissionResult is the response to a permission mutation.
@@ -811,7 +1228,17 @@ func (s *Server) permissionGrant(ctx context.Context, params json.RawMessage) (a
 	if role == "" {
 		role = store.RolePeer
 	}
-	if err := s.n.GrantPermission(ctx, s.sender(), p.OwnerSession, p.PeerSession, role); err != nil {
+	var expires time.Time
+	if p.ExpiresAt != "" {
+		t, err := time.Parse(time.RFC3339, p.ExpiresAt)
+		if err != nil {
+			return nil, protocol.Errorf(protocol.CodeInvalidParams, "expiresAt must be RFC3339: %v", err)
+		}
+		expires = t
+	} else if p.TTLSeconds > 0 {
+		expires = time.Now().UTC().Add(time.Duration(p.TTLSeconds) * time.Second)
+	}
+	if err := s.n.GrantPermissionWithExpiry(ctx, s.sender(), p.OwnerSession, p.PeerSession, role, expires); err != nil {
 		return nil, toRPCError(err)
 	}
 	return PermissionResult{
@@ -855,16 +1282,38 @@ type PermissionListResult struct {
 }
 
 // permissionList returns the active grants held by a peer.
+// Authorization is against the grant subject (peer) and owner, not mere
+// local session existence: a peer may list its own grants, and a visible
+// local session may be listed by same-principal or granted callers.
+// Remote-qualified grant subjects have no local session record, so the
+// absence of a record must not skip the check (self-only there).
 func (s *Server) permissionList(ctx context.Context, params json.RawMessage) (any, *protocol.RPCError) {
 	var p PermissionListParams
 	if err := decodeParams(params, &p); err != nil {
 		return nil, err
 	}
-	perms, err := s.n.ListPermissions(ctx, p.PeerSession)
-	if err != nil {
-		return nil, toRPCError(err)
+	if p.PeerSession == "" {
+		return nil, protocol.Errorf(protocol.CodeInvalidParams, "peerSession is required")
 	}
-	return PermissionListResult{Permissions: perms}, nil
+	// Self-listing is always allowed (the caller is the grant subject).
+	if s.sender().SessionID == p.PeerSession {
+		perms, err := s.n.ListPermissions(ctx, p.PeerSession)
+		if err != nil {
+			return nil, toRPCError(err)
+		}
+		return PermissionListResult{Permissions: perms}, nil
+	}
+	if _, err := s.n.Store().GetSession(ctx, p.PeerSession); err == nil {
+		if err := s.n.AuthorizeObserve(ctx, s.sender(), p.PeerSession); err != nil {
+			return nil, toRPCError(err)
+		}
+		perms, err := s.n.ListPermissions(ctx, p.PeerSession)
+		if err != nil {
+			return nil, toRPCError(err)
+		}
+		return PermissionListResult{Permissions: perms}, nil
+	}
+	return nil, protocol.Errorf(protocol.CodeForbidden, "only the grant subject or a visible session may list permissions")
 }
 
 // sender returns the transport-authenticated sender identity.
@@ -924,8 +1373,10 @@ func toRPCError(err error) *protocol.RPCError {
 	switch {
 	case errors.Is(err, node.ErrNotFound):
 		return protocol.Errorf(protocol.CodeInvalidParams, "%v", err)
-	case errors.Is(err, node.ErrForbidden):
+	case errors.Is(err, node.ErrForbidden), errors.Is(err, store.ErrForbidden):
 		return protocol.Errorf(protocol.CodeForbidden, "%v", err)
+	case errors.Is(err, store.ErrConflict):
+		return protocol.Errorf(protocol.CodeConflict, "%v", err)
 	case errors.Is(err, node.ErrLimitExceeded):
 		return protocol.Errorf(protocol.CodeLimitExceeded, "%v", err)
 	case errors.Is(err, context.Canceled):

@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/adapter"
-	"github.com/bamn/intercom/internal/adapter/acp"
-	"github.com/bamn/intercom/internal/config"
-	"github.com/bamn/intercom/internal/node"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/adapter"
+	"github.com/B-A-M-N/intercom/internal/adapter/acp"
+	"github.com/B-A-M-N/intercom/internal/config"
+	"github.com/B-A-M-N/intercom/internal/node"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // Test_WakePolicyIsApplied covers the wake policy requirement of spec
@@ -35,12 +35,12 @@ func Test_WakePolicyIsApplied(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.delivered) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.deliveredCount() == 1 })
 	if !ok {
 		t.Fatal("the queued message was not delivered")
 	}
-	if len(e.bob.woken) != 0 {
-		t.Errorf("wake=none woke the recipient %d times", len(e.bob.woken))
+	if e.bob.wokenCount() != 0 {
+		t.Errorf("wake=none woke the recipient %d times", e.bob.wokenCount())
 	}
 
 	// A queue delivery with wake=if_idle must wake an idle recipient.
@@ -55,9 +55,9 @@ func Test_WakePolicyIsApplied(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok = waitFor(t, 2*time.Second, func() bool { return len(e.bob.woken) == 1 })
+	ok = waitFor(t, 2*time.Second, func() bool { return e.bob.wokenCount() == 1 })
 	if !ok {
-		t.Fatalf("wake=if_idle did not wake the idle recipient; woken=%d", len(e.bob.woken))
+		t.Fatalf("wake=if_idle did not wake the idle recipient; woken=%d", e.bob.wokenCount())
 	}
 }
 
@@ -137,6 +137,11 @@ func Test_RetentionBoundsTheStore(t *testing.T) {
 
 	if _, err := e.send(e.aliceSender(), e.bobID, "old", "cmd_test000000000000000000000023", protocol.DeliveryNotify); err != nil {
 		t.Fatalf("send: %v", err)
+	}
+	// Retention purges terminal messages only; wait until the live
+	// delivery has acknowledged this one (presented -> acknowledged).
+	if !waitFor(t, 2*time.Second, func() bool { return e.bob.notifiedCount() == 1 }) {
+		t.Fatal("message was not delivered")
 	}
 
 	report, err := e.node.Maintain(e.ctx)
@@ -367,11 +372,11 @@ func Test_NotifyFallbackIsNotificationOnly(t *testing.T) {
 	}
 
 	// The message was presented, not queued for a turn.
-	if len(e.bob.delivered) != 0 {
-		t.Errorf("the fallback delivered %d messages to the turn path, want 0", len(e.bob.delivered))
+	if e.bob.deliveredCount() != 0 {
+		t.Errorf("the fallback delivered %d messages to the turn path, want 0", e.bob.deliveredCount())
 	}
-	if len(e.bob.notified) != 1 {
-		t.Errorf("the fallback produced %d notifications, want 1", len(e.bob.notified))
+	if e.bob.notifiedCount() != 1 {
+		t.Errorf("the fallback produced %d notifications, want 1", e.bob.notifiedCount())
 	}
 }
 
@@ -442,12 +447,12 @@ func Test_InjectedMessagesRetainProvenance(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.delivered) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.deliveredCount() == 1 })
 	if !ok {
 		t.Fatal("the recipient did not receive the message")
 	}
 
-	injected := e.bob.delivered[0]
+	injected := e.bob.deliveredMsg(0)
 
 	// The rendered body is marked as peer-supplied content.
 	if injected.Body.Type != "peer-message" {
@@ -499,12 +504,12 @@ func Test_NotificationIsNotWrapped(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.notified) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.notifiedCount() == 1 })
 	if !ok {
 		t.Fatal("the recipient was not notified")
 	}
-	if e.bob.notified[0].Body.Type != "text" {
-		t.Errorf("notified body type = %q, want text", e.bob.notified[0].Body.Type)
+	if e.bob.notifiedMsg(0).Body.Type != "text" {
+		t.Errorf("notified body type = %q, want text", e.bob.notifiedMsg(0).Body.Type)
 	}
 }
 
@@ -520,7 +525,7 @@ func Test_RecipientDeduplicatesMessageID(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	ok := waitFor(t, 2*time.Second, func() bool { return len(e.bob.notified) == 1 })
+	ok := waitFor(t, 2*time.Second, func() bool { return e.bob.notifiedCount() == 1 })
 	if !ok {
 		t.Fatal("the recipient was not notified")
 	}
@@ -534,8 +539,8 @@ func Test_RecipientDeduplicatesMessageID(t *testing.T) {
 	e.node.Redeiver(e.ctx, duplicated)
 
 	time.Sleep(150 * time.Millisecond)
-	if len(e.bob.notified) != 1 {
-		t.Errorf("the recipient saw %d notifications, want 1", len(e.bob.notified))
+	if e.bob.notifiedCount() != 1 {
+		t.Errorf("the recipient saw %d notifications, want 1", e.bob.notifiedCount())
 	}
 
 	// The dedup decision is on the receipt trail, so it is observable.

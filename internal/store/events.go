@@ -8,8 +8,48 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
+
+// nextEventSequenceTx allocates the next sequence for a session from the
+// durable high-water mark, independent of retained journal rows. The mark
+// is the max of: persisted high-water, retained MAX(sequence), and the
+// compaction floor. Allocating (and persisting) inside the caller's
+// transaction makes the sequence monotonic across full compaction and
+// restart.
+func (s *Store) nextEventSequenceTx(ctx context.Context, tx *sql.Tx, sessionID string) (uint64, error) {
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MAX(sequence) FROM session_events WHERE session_id = ?`,
+		sessionID).Scan(&maxSeq); err != nil {
+		return 0, fmt.Errorf("store: max sequence: %w", err)
+	}
+	var floor sql.NullInt64
+	_ = tx.QueryRowContext(ctx,
+		`SELECT compacted_through FROM session_compaction WHERE session_id = ?`, sessionID).Scan(&floor)
+	var high sql.NullInt64
+	_ = tx.QueryRowContext(ctx,
+		`SELECT high_water FROM session_event_sequences WHERE session_id = ?`, sessionID).Scan(&high)
+	base := int64(0)
+	if maxSeq.Valid && maxSeq.Int64 > base {
+		base = maxSeq.Int64
+	}
+	if floor.Valid && floor.Int64 > base {
+		base = floor.Int64
+	}
+	if high.Valid && high.Int64 > base {
+		base = high.Int64
+	}
+	seq := uint64(base) + 1
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO session_event_sequences (session_id, high_water) VALUES (?, ?)
+		 ON CONFLICT(session_id) DO UPDATE SET high_water = excluded.high_water`,
+		sessionID, int64(seq))
+	if err != nil {
+		return 0, fmt.Errorf("store: persist sequence high-water: %w", err)
+	}
+	return seq, nil
+}
 
 // AppendEvent appends an event to a session's journal and assigns its
 // sequence number.
@@ -21,15 +61,9 @@ func (s *Store) AppendEvent(ctx context.Context, ev protocol.EventEnvelope, caus
 	var out protocol.EventEnvelope
 
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
-		var maxSeq sql.NullInt64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT MAX(sequence) FROM session_events WHERE session_id = ?`,
-			ev.SessionID).Scan(&maxSeq); err != nil {
-			return fmt.Errorf("store: max sequence: %w", err)
-		}
-		seq := uint64(1)
-		if maxSeq.Valid && maxSeq.Int64 > 0 {
-			seq = uint64(maxSeq.Int64) + 1
+		seq, err := s.nextEventSequenceTx(ctx, tx, ev.SessionID)
+		if err != nil {
+			return err
 		}
 		ev.Sequence = seq
 		if ev.Timestamp.IsZero() {
@@ -43,7 +77,7 @@ func (s *Store) AppendEvent(ctx context.Context, ev protocol.EventEnvelope, caus
 		if len(payload) == 0 {
 			payload = []byte("{}")
 		}
-		_, err := tx.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`INSERT INTO session_events (session_id, sequence, event_id, event_type, timestamp, causation_id, payload)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			ev.SessionID, ev.Sequence, ev.EventID, ev.EventType,
@@ -138,10 +172,20 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterCursor uint64
 	return res, rows.Err()
 }
 
-// LatestSequence returns the highest assigned sequence for a session.
+// LatestSequence returns the highest assigned sequence for a session,
+// from the durable high-water mark (authoritative after compaction).
 func (s *Store) LatestSequence(ctx context.Context, sessionID string) (uint64, error) {
-	var maxSeq sql.NullInt64
+	var high sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
+		`SELECT high_water FROM session_event_sequences WHERE session_id = ?`, sessionID).Scan(&high)
+	if err == nil && high.Valid && high.Int64 > 0 {
+		return uint64(high.Int64), nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("store: latest sequence: %w", err)
+	}
+	var maxSeq sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
 		`SELECT MAX(sequence) FROM session_events WHERE session_id = ?`, sessionID).Scan(&maxSeq)
 	if err != nil {
 		return 0, fmt.Errorf("store: latest sequence: %w", err)
@@ -252,16 +296,28 @@ func (s *Store) CompactSessionsOlderThan(ctx context.Context, cutoff time.Time) 
 	for _, id := range sessions {
 		// Compact everything strictly older than the oldest retained
 		// event in this session, so the retained window is contiguous.
+		// If no event is retained, compact the whole journal (the old
+		// code skipped this case, so fully old journals never compacted).
 		var oldest sql.NullInt64
 		if err := s.db.QueryRowContext(ctx,
 			`SELECT MIN(sequence) FROM session_events WHERE session_id = ? AND timestamp >= ?`,
 			id, mark).Scan(&oldest); err != nil {
 			return total, fmt.Errorf("store: oldest retained event: %w", err)
 		}
-		if !oldest.Valid {
-			continue
+		before := uint64(1)
+		if oldest.Valid {
+			before = uint64(oldest.Int64)
+		} else {
+			// Fully old journal: compact through the durable high-water
+			// mark so the floor (and therefore the next sequence)
+			// survives total compaction.
+			high, err := s.LatestSequence(ctx, id)
+			if err != nil {
+				return total, fmt.Errorf("store: sequence high-water: %w", err)
+			}
+			before = high + 1
 		}
-		n, err := s.CompactEvents(ctx, id, uint64(oldest.Int64))
+		n, err := s.CompactEvents(ctx, id, before)
 		if err != nil {
 			return total, err
 		}
@@ -287,14 +343,9 @@ func (s *Store) compactionFloor(ctx context.Context, sessionID string) (uint64, 
 // AppendEventTx appends an event inside an existing transaction, so that an
 // event and the state change it describes commit atomically.
 func (s *Store) AppendEventTx(ctx context.Context, tx *sql.Tx, ev protocol.EventEnvelope, causationID string) (protocol.EventEnvelope, error) {
-	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT MAX(sequence) FROM session_events WHERE session_id = ?`, ev.SessionID).Scan(&maxSeq); err != nil {
-		return protocol.EventEnvelope{}, fmt.Errorf("store: max sequence: %w", err)
-	}
-	seq := uint64(1)
-	if maxSeq.Valid && maxSeq.Int64 > 0 {
-		seq = uint64(maxSeq.Int64) + 1
+	seq, err := s.nextEventSequenceTx(ctx, tx, ev.SessionID)
+	if err != nil {
+		return protocol.EventEnvelope{}, err
 	}
 	ev.Sequence = seq
 	if ev.Timestamp.IsZero() {
@@ -307,7 +358,7 @@ func (s *Store) AppendEventTx(ctx context.Context, tx *sql.Tx, ev protocol.Event
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
-	_, err := tx.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO session_events (session_id, sequence, event_id, event_type, timestamp, causation_id, payload)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ev.SessionID, ev.Sequence, ev.EventID, ev.EventType,

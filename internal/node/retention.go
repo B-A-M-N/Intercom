@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // RetentionReport summarizes one retention pass.
@@ -49,13 +49,14 @@ func (n *Node) Maintain(ctx context.Context) (RetentionReport, error) {
 	}
 	report.Expired = len(expired)
 
-	// Purge messages past the retention horizon. Messages that carry a live
-	// expiry are kept until they expire and are voided above, so an
-	// unexpired message is never dropped early.
+	// Purge messages past the retention horizon. Cutoff is the OLDER of
+	// retention and the deduplication horizon, so dedup obligations are
+	// preserved. Store purge only removes terminal messages; pending and
+	// claimed (leased) messages are never purged.
 	cutoff := now.Add(-n.cfg.Limits.MessageRetention)
 	if n.cfg.Limits.DeduplicationHorizon > 0 {
 		horizon := now.Add(-n.cfg.Limits.DeduplicationHorizon)
-		if horizon.After(cutoff) {
+		if horizon.Before(cutoff) {
 			cutoff = horizon
 		}
 	}

@@ -137,7 +137,9 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertNotIn(MODE_STEER, adapter.delivery_modes)
 
     def test_notify_never_claims_injection(self) -> None:
+        import tempfile
         adapter = HermesAdapter(None)
+        adapter.set_state_dir(tempfile.mkdtemp(prefix="ic-test-"))
         result = adapter.notify("ses_x", {"body": {"type": "text", "text": "hi"}})
         self.assertEqual(result.status, RECEIPT_PRESENTED)
         self.assertNotEqual(result.status, "injected")
@@ -194,7 +196,8 @@ class TestMuseAdapter(unittest.TestCase):
         method, params = msp.calls[0]
         self.assertEqual(method, "turn/steer")
         self.assertEqual(params["expectedTurnId"], "turn_1")
-        self.assertEqual(params["input"][0]["text"], "steer me")
+        self.assertTrue(params["input"][0]["text"].startswith("[PEER MESSAGE"))
+        self.assertIn("steer me", params["input"][0]["text"])
 
     def test_steer_without_a_turn_is_refused(self) -> None:
         msp = self.FakeMSP()
@@ -239,15 +242,18 @@ class TestMuseAdapter(unittest.TestCase):
         self.assertEqual(msp.calls[0][0], "turn/steer")
 
     def test_notify_does_not_use_a_model_turn(self) -> None:
+        import tempfile
         msp = self.FakeMSP()
         adapter = MuseAdapter(msp)
+        adapter.set_state_dir(tempfile.mkdtemp(prefix="ic-test-"))
 
         result = adapter.notify("ses_x", {"body": {"type": "text", "text": "FYI"}})
 
         self.assertEqual(result.status, RECEIPT_PRESENTED)
         self.assertNotEqual(result.status, "injected")
         self.assertEqual(msp.calls, [], "notification must not drive a model turn")
-        self.assertEqual(adapter.notes("ses_x"), ["FYI"])
+        self.assertEqual(len(adapter.notes("ses_x")), 1)
+        self.assertIn("FYI", adapter.notes("ses_x")[0])
 
     def test_muse_claims_native_steering(self) -> None:
         caps = {c.id: c for c in MuseAdapter(self.FakeMSP()).capabilities}

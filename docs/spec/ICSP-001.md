@@ -755,3 +755,21 @@ The defining behavior is:
 **Any authorized agent can communicate with another independently running agent, across supported harness boundaries, while preserving identity, session continuity, delivery accountability, and the recipient's authority.**
 
 Intercom shall be useful without a central orchestrator, distributed scheduler, shared model context, or single-vendor runtime.
+
+## 18. Remediation Addendum (federation security, 2026)
+
+IC-REMOTE requires mTLS with per-host ed25519 identity, fingerprint
+pinning at enrollment, and host-qualified sender identities
+("hostId/sessionId"). Bearer tokens MUST NOT traverse the wire.
+Non-loopback plaintext federation MUST be rejected (TLS only by
+construction). Remote admission MUST reuse atomic admission with a
+full canonical fingerprint (authenticated origin, original command/
+message ids, recipient, payload, mode, correlation, expiry, hops).
+Duplicate StoreMessage MUST NOT append a second acceptance receipt.
+Outbound transfers MUST persist the full envelope and retry with
+bounded backoff, TTL, and terminal classification. Revoked hosts MUST
+lose permission for new communication immediately; rotation replaces
+the pinned fingerprint. Trust domains are server-assigned
+("local:<hostId>"), never client-supplied security evidence. The
+daemon principal is the local Unix user; local clients sharing that
+user are not strongly isolated agent principals.

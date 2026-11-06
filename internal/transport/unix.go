@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -34,12 +35,23 @@ type UnixListener struct {
 	path     string
 	maxFrame int
 	owned    bool
+	// lockFile holds the exclusive flock that proves single ownership of
+	// path for this process's lifetime.
+	lockFile *os.File
+	// ownsDev/ownsIno identify the filesystem object this listener bound,
+	// so Close only unlinks the path if it still names that object.
+	ownsDev uint64
+	ownsIno uint64
 }
 
 // ListenUnix binds a Unix domain socket at path.
 //
 // The socket file is created with restrictive permissions so that only the
-// owning user can connect.
+// owning user can connect. Single ownership is enforced with an exclusive
+// flock on <path>.lock held for the listener's lifetime: a second daemon
+// starting on the same socket fails without disturbing the first. A stale
+// socket file is removed only after a liveness check proves no listener
+// answers on it; a live socket is never unlinked.
 func ListenUnix(ctx context.Context, path string) (*UnixListener, error) {
 	if path == "" {
 		return nil, errors.New("transport: socket path is required")
@@ -49,10 +61,43 @@ func ListenUnix(ctx context.Context, path string) (*UnixListener, error) {
 			return nil, fmt.Errorf("transport: create socket dir: %w", err)
 		}
 	}
-	// Remove a stale socket left by a previous run. A live socket would fail
-	// to bind anyway, so this cannot disconnect a running host.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("transport: remove stale socket: %w", err)
+	// Single-owner lock: exclusive, non-blocking. The lock file survives
+	// only as a lock; the socket itself is what clients dial.
+	lockPath := path + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("transport: open socket lock: %w", err)
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("transport: socket %s is already owned by another daemon: %w", path, err)
+	}
+	// From here on, any failure must release the lock.
+	owned := false
+	defer func() {
+		if !owned {
+			_ = unlockAndClose(lockFile)
+		}
+	}()
+
+	// Liveness check before treating an existing socket as stale. A live
+	// listener accepts the dial; a stale file refuses. If the dial
+	// succeeds, refuse to start rather than stealing the pathname.
+	if _, statErr := os.Lstat(path); statErr == nil {
+		if live := socketAlive(path); live {
+			return nil, fmt.Errorf("transport: socket %s is live (another daemon owns it)", path)
+		}
+		// Stale: must be a socket file before removing.
+		if fi, lerr := os.Lstat(path); lerr == nil {
+			if fi.Mode()&os.ModeSocket == 0 {
+				return nil, fmt.Errorf("transport: %s exists and is not a socket", path)
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("transport: remove stale socket: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("transport: stat socket: %w", statErr)
 	}
 
 	addr, err := net.ResolveUnixAddr("unix", path)
@@ -67,8 +112,33 @@ func ListenUnix(ctx context.Context, path string) (*UnixListener, error) {
 		ln.Close()
 		return nil, fmt.Errorf("transport: chmod socket: %w", err)
 	}
+	var dev, ino uint64
+	if fi, serr := os.Lstat(path); serr == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			dev, ino = uint64(st.Dev), uint64(st.Ino)
+		}
+	}
+	owned = true
+	return &UnixListener{ln: ln, path: path, maxFrame: DefaultMaxFrameBytes, owned: true, lockFile: lockFile, ownsDev: dev, ownsIno: ino}, nil
+}
 
-	return &UnixListener{ln: ln, path: path, maxFrame: DefaultMaxFrameBytes, owned: true}, nil
+// socketAlive reports whether a listener answers on the Unix socket at path.
+func socketAlive(path string) bool {
+	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	conn, err := d.Dial("unix", path)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func unlockAndClose(f *os.File) error {
+	if f == nil {
+		return nil
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return f.Close()
 }
 
 // Accept waits for the next connection and authenticates it.
@@ -104,12 +174,23 @@ func (l *UnixListener) Accept(ctx context.Context) (Conn, error) {
 // Addr returns the listener's socket path.
 func (l *UnixListener) Addr() net.Addr { return l.ln.Addr() }
 
-// Close shuts the listener down and removes the socket file.
+// Close shuts the listener down and removes the socket file only if it
+// still names the filesystem object this listener bound.
 func (l *UnixListener) Close() error {
 	err := l.ln.Close()
 	if l.owned && l.path != "" {
-		_ = os.Remove(l.path)
+		if fi, serr := os.Lstat(l.path); serr == nil {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok && l.ownsIno != 0 {
+				if uint64(st.Dev) == l.ownsDev && uint64(st.Ino) == l.ownsIno {
+					_ = os.Remove(l.path)
+				}
+			} else {
+				_ = os.Remove(l.path)
+			}
+		}
 	}
+	_ = unlockAndClose(l.lockFile)
+	l.lockFile = nil
 	return err
 }
 

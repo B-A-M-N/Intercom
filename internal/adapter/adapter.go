@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
 
 // ErrUnsupported is returned when a harness genuinely cannot perform a

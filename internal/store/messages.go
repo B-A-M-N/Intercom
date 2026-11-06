@@ -2,29 +2,54 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/protocol"
 )
+
+// newClaimToken mints a fencing token for one inbox claim.
+func newClaimToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
 
 // InboxState tracks whether a message has been durably accepted by the
 // recipient's inbox (ICSP-001 section 5.4).
 type InboxState string
 
 const (
-	// InboxPending means the message is stored but not yet in a recipient inbox.
+	// InboxPending means the message is stored but not yet claimed by a
+	// recipient adapter.
 	InboxPending InboxState = "pending"
 	// InboxAccepted means the recipient inbox durably accepted the message.
 	InboxAccepted InboxState = "accepted"
+	// InboxClaimed means a recipient adapter holds an exclusive lease.
+	InboxClaimed InboxState = "claimed"
+	// InboxAcknowledged means the recipient reported presented/injected/
+	// handled/delivered; it must not be presented again.
+	InboxAcknowledged InboxState = "acknowledged"
+	// InboxRejected means delivery was refused.
+	InboxRejected InboxState = "rejected"
 	// InboxDelivered means delivery to the recipient completed.
 	InboxDelivered InboxState = "delivered"
 	// InboxVoided means the message was voided without delivery.
 	InboxVoided InboxState = "voided"
+	// InboxDeadLetter means redelivery attempts were exhausted.
+	InboxDeadLetter InboxState = "dead_letter"
 )
+
+// MaxDeliveryAttempts bounds redelivery; beyond it a message is dead-lettered
+// rather than retried forever.
+const MaxDeliveryAttempts = 10
 
 // StoreMessage durably stores a message and returns it.
 //
@@ -49,7 +74,7 @@ func (s *Store) StoreMessage(ctx context.Context, msg protocol.Message, principa
 		if msg.ExpiresAt != nil {
 			expires = msg.ExpiresAt.UTC().Format(TimestampLayout)
 		}
-		_, err := tx.ExecContext(ctx,
+		res, err := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO messages (message_id, command_id, from_session, to_session,
 			        from_principal, body, delivery, reply_to, correlation_id, created_at,
 			        expires_at, metadata, inbox_state)
@@ -60,6 +85,21 @@ func (s *Store) StoreMessage(ctx context.Context, msg protocol.Message, principa
 			string(InboxPending))
 		if err != nil {
 			return fmt.Errorf("store: insert message: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			// Duplicate message id: verify it is the identical payload
+			// (conflicting reuse fails) and do NOT append a fresh
+			// acceptance receipt.
+			var existingBody, existingTo, existingFrom string
+			err := tx.QueryRowContext(ctx, `SELECT body, to_session, from_session FROM messages WHERE message_id = ?`, msg.MessageID).Scan(&existingBody, &existingTo, &existingFrom)
+			if err != nil {
+				return fmt.Errorf("store: load duplicate message: %w", err)
+			}
+			if existingBody != string(body) || existingTo != msg.To || existingFrom != msg.From {
+				return ErrConflict
+			}
+			return nil
 		}
 
 		_, err = tx.ExecContext(ctx,
@@ -82,10 +122,10 @@ func (s *Store) GetMessage(ctx context.Context, messageID string) (protocol.Mess
 	var createdAt scanTime
 	row := s.db.QueryRowContext(ctx,
 		`SELECT message_id, command_id, from_session, to_session, body, delivery,
-		        reply_to, correlation_id, created_at, expires_at, metadata
+		        reply_to, correlation_id, created_at, expires_at, metadata, conversation_id
 		 FROM messages WHERE message_id = ?`, messageID)
 	if err := row.Scan(&msg.MessageID, &msg.CommandID, &msg.From, &msg.To, &body, &delivery,
-		&msg.ReplyTo, &msg.CorrelationID, &createdAt, &expires, &metadata); err != nil {
+		&msg.ReplyTo, &msg.CorrelationID, &createdAt, &expires, &metadata, &msg.ConversationID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return protocol.Message{}, ErrNotFound
 		}
@@ -107,6 +147,13 @@ func (s *Store) GetMessage(ctx context.Context, messageID string) (protocol.Mess
 			return protocol.Message{}, fmt.Errorf("store: decode expires_at: %w", err)
 		}
 		msg.ExpiresAt = &t
+	}
+	// Claim fencing fields (populated after ClaimInbox).
+	var token string
+	var gen int64
+	if err := s.db.QueryRowContext(ctx, `SELECT claim_token, claim_generation FROM message_claims WHERE message_id = ?`, messageID).Scan(&token, &gen); err == nil {
+		msg.ClaimToken = token
+		msg.ClaimGeneration = gen
 	}
 	return msg, nil
 }
@@ -252,35 +299,125 @@ func (s *Store) LatestReceipt(ctx context.Context, messageID string) (protocol.R
 	return r, nil
 }
 
-// PendingInbox returns the messages durably stored for a recipient session
-// that have not yet been delivered.
+// DefaultClaimLease bounds how long a claimed message stays exclusive.
+const DefaultClaimLease = 30 * time.Second
+
+// PendingInbox claims messages for a session (owner = session itself) with
+// an exclusive lease. It is the adapter inbox poll: a claimed message is
+// not re-presented until its lease expires or it is acknowledged, which
+// prevents repeated presentation of notifications.
 func (s *Store) PendingInbox(ctx context.Context, sessionID string, limit int) ([]protocol.Message, error) {
+	return s.ClaimInbox(ctx, sessionID, sessionID, DefaultClaimLease, limit)
+}
+
+// ClaimInbox atomically claims up to limit claimable messages for owner,
+// expiring leases, voiding expired messages, and dead-lettering exhausted
+// attempts. Claimable means pending/accepted, or claimed with an expired
+// lease. Already-claimed (unexpired) messages are not returned.
+func (s *Store) ClaimInbox(ctx context.Context, sessionID, owner string, lease time.Duration, limit int) ([]protocol.Message, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT message_id FROM messages WHERE to_session = ? AND inbox_state IN (?, ?)
-		 ORDER BY created_at ASC LIMIT ?`,
-		sessionID, InboxPending, InboxAccepted, limit)
-	if err != nil {
-		return nil, fmt.Errorf("store: query pending inbox: %w", err)
+	if lease <= 0 {
+		lease = DefaultClaimLease
 	}
-	defer rows.Close()
+	now := time.Now().UTC()
+	nowStr := now.Format(TimestampLayout)
+	leaseStr := now.Add(lease).Format(TimestampLayout)
 
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("store: scan pending id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
+	// Expire due messages for this session before claiming: an expired
+	// message must never be injected.
+	expired, err := s.ExpiredMessages(ctx, now, limit)
+	if err != nil {
 		return nil, err
 	}
+	for _, id := range expired {
+		msg, err := s.GetMessage(ctx, id)
+		if err != nil {
+			continue
+		}
+		_ = s.RecordReceipt(ctx, protocol.Receipt{MessageID: msg.MessageID, CommandID: msg.CommandID, Status: protocol.ReceiptExpired, From: msg.From, To: msg.To, ObservedAt: now, Detail: "message expired before delivery completed"})
+		_ = s.SetInboxState(ctx, msg.MessageID, InboxVoided)
+	}
 
-	out := make([]protocol.Message, 0, len(ids))
-	for _, id := range ids {
+	var claimed []string
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT message_id, delivery_attempts, command_id, from_session FROM messages
+			 WHERE to_session = ? AND (
+			   inbox_state IN (?, ?)
+			   OR (inbox_state = ? AND (claim_expires = '' OR claim_expires < ?))
+			 )
+			 ORDER BY created_at ASC LIMIT ?`,
+			sessionID, InboxPending, InboxAccepted, InboxClaimed, nowStr, limit)
+		if err != nil {
+			return fmt.Errorf("store: query claimable: %w", err)
+		}
+		type cand struct {
+			id       string
+			attempts int
+			command  string
+			from     string
+		}
+		var cands []cand
+		for rows.Next() {
+			var c cand
+			if err := rows.Scan(&c.id, &c.attempts, &c.command, &c.from); err != nil {
+				rows.Close()
+				return fmt.Errorf("store: scan claimable: %w", err)
+			}
+			cands = append(cands, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, c := range cands {
+			if c.attempts+1 > MaxDeliveryAttempts {
+				if _, err := tx.ExecContext(ctx, `UPDATE messages SET inbox_state = ?, claim_owner = '', claim_expires = '' WHERE message_id = ?`, string(InboxDeadLetter), c.id); err != nil {
+					return fmt.Errorf("store: dead-letter: %w", err)
+				}
+				if _, err := tx.ExecContext(ctx,
+					`INSERT INTO receipts (message_id, command_id, status, from_session, to_session, detail, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					c.id, c.command, protocol.ReceiptRejected, c.from, sessionID, "delivery attempts exhausted; dead-lettered", nowStr); err != nil {
+					return fmt.Errorf("store: dead-letter receipt: %w", err)
+				}
+				continue
+			}
+			res, err := tx.ExecContext(ctx,
+				`UPDATE messages SET inbox_state = ?, claim_owner = ?, claim_expires = ?, delivery_attempts = delivery_attempts + 1
+				 WHERE message_id = ? AND (
+				   inbox_state IN (?, ?)
+				   OR (inbox_state = ? AND (claim_expires = '' OR claim_expires < ?))
+				 )`,
+				string(InboxClaimed), owner, leaseStr, c.id, InboxPending, InboxAccepted, InboxClaimed, nowStr)
+			if err != nil {
+				return fmt.Errorf("store: claim: %w", err)
+			}
+			if n, _ := res.RowsAffected(); n == 1 {
+				token := newClaimToken()
+				gen := int64(1)
+				var cur sql.NullInt64
+				_ = tx.QueryRowContext(ctx, `SELECT claim_generation FROM message_claims WHERE message_id = ?`, c.id).Scan(&cur)
+				if cur.Valid {
+					gen = cur.Int64 + 1
+				}
+				if _, err := tx.ExecContext(ctx,
+					`INSERT INTO message_claims (message_id, claim_token, claim_generation) VALUES (?, ?, ?)
+					 ON CONFLICT(message_id) DO UPDATE SET claim_token = excluded.claim_token, claim_generation = excluded.claim_generation`,
+					c.id, token, gen); err != nil {
+					return fmt.Errorf("store: claim fencing: %w", err)
+				}
+				claimed = append(claimed, c.id)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.Message, 0, len(claimed))
+	for _, id := range claimed {
 		msg, err := s.GetMessage(ctx, id)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
@@ -288,17 +425,219 @@ func (s *Store) PendingInbox(ctx context.Context, sessionID string, limit int) (
 			}
 			return nil, err
 		}
+		// Expiry re-check at hand-off: never hand an expired message to an
+		// adapter for injection.
+		if msg.ExpiresAt != nil && time.Now().UTC().After(*msg.ExpiresAt) {
+			_ = s.RecordReceipt(ctx, protocol.Receipt{MessageID: msg.MessageID, CommandID: msg.CommandID, Status: protocol.ReceiptExpired, From: msg.From, To: msg.To, ObservedAt: time.Now().UTC(), Detail: "message expired before delivery completed"})
+			_ = s.SetInboxState(ctx, msg.MessageID, InboxVoided)
+			continue
+		}
 		out = append(out, msg)
 	}
 	return out, nil
+}
+
+// MessagePrincipal returns the authenticated sender principal recorded at
+// admission (from_principal), for delivery-time policy rechecks.
+func (s *Store) MessagePrincipal(ctx context.Context, messageID string) (string, error) {
+	var principal string
+	err := s.db.QueryRowContext(ctx, `SELECT from_principal FROM messages WHERE message_id = ?`, messageID).Scan(&principal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: message principal: %w", err)
+	}
+	return principal, nil
+}
+
+// ClaimOwner returns the current claim owner for a message, if claimed.
+func (s *Store) ClaimOwner(ctx context.Context, messageID string) (owner string, state InboxState, expires time.Time, err error) {
+	var ownerStr, expStr, stateStr string
+	row := s.db.QueryRowContext(ctx, `SELECT claim_owner, inbox_state, claim_expires FROM messages WHERE message_id = ?`, messageID)
+	if err := row.Scan(&ownerStr, &stateStr, &expStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", time.Time{}, ErrNotFound
+		}
+		return "", "", time.Time{}, fmt.Errorf("store: claim owner: %w", err)
+	}
+	if expStr != "" {
+		if t, perr := parseTime(expStr); perr == nil {
+			expires = t
+		}
+	}
+	return ownerStr, InboxState(stateStr), expires, nil
+}
+
+// ClaimInfo returns claim owner plus fencing token/generation.
+func (s *Store) ClaimInfo(ctx context.Context, messageID string) (owner string, token string, generation int64, state InboxState, expires time.Time, err error) {
+	owner, state, expires, err = s.ClaimOwner(ctx, messageID)
+	if err != nil {
+		return "", "", 0, "", time.Time{}, err
+	}
+	_ = s.db.QueryRowContext(ctx, `SELECT claim_token, claim_generation FROM message_claims WHERE message_id = ?`, messageID).Scan(&token, &generation)
+	return owner, token, generation, state, expires, nil
+}
+
+// RenewClaim extends a claim lease iff the caller still holds the current
+// token/generation. It fails closed for superseded claimants.
+// Both the current claim token and generation are required (fencing):
+// an empty token or a zero generation is a conflict, not a renewal.
+func (s *Store) RenewClaim(ctx context.Context, messageID, owner, token string, generation int64, lease time.Duration) error {
+	if lease <= 0 {
+		lease = DefaultClaimLease
+	}
+	if token == "" || generation <= 0 {
+		return ErrConflict
+	}
+	now := time.Now().UTC()
+	leaseStr := now.Add(lease).Format(TimestampLayout)
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		var curToken string
+		var curGen int64
+		if err := tx.QueryRowContext(ctx, `SELECT claim_token, claim_generation FROM message_claims WHERE message_id = ?`, messageID).Scan(&curToken, &curGen); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrConflict
+			}
+			return fmt.Errorf("store: renew claim lookup: %w", err)
+		}
+		if token == "" || curToken == "" || generation <= 0 || curGen <= 0 {
+			return ErrConflict
+		}
+		if curToken != token || curGen != generation {
+			return ErrConflict
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE messages SET claim_expires = ? WHERE message_id = ? AND inbox_state = ? AND claim_owner = ?`, leaseStr, messageID, InboxClaimed, owner)
+		if err != nil {
+			return fmt.Errorf("store: renew claim: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrConflict
+		}
+		return nil
+	})
+}
+
+// RecordDeliveryOutcome atomically records a receipt, transitions the
+// inbox, settles the command (when the outcome resolves admission), and
+// appends the journal event in one commit. Invalid/stale transitions are
+// rejected rather than partially applied.
+func (s *Store) RecordDeliveryOutcome(ctx context.Context, receipt protocol.Receipt, event protocol.EventEnvelope) error {
+	if !receipt.Status.Valid() {
+		return fmt.Errorf("store: invalid receipt status %q", receipt.Status)
+	}
+	// Map receipt to inbox transition (same mapping as the node layer).
+	var target InboxState
+	switch receipt.Status {
+	case protocol.ReceiptDelivered:
+		target = InboxDelivered
+	case protocol.ReceiptPresented, protocol.ReceiptInjected, protocol.ReceiptHandled:
+		target = InboxAcknowledged
+	case protocol.ReceiptRejected:
+		target = InboxRejected
+	case protocol.ReceiptExpired:
+		target = InboxVoided
+	default:
+		target = ""
+	}
+	// Only terminal receipts settle the command. Presented/injected are
+	// non-terminal observations: they free admission capacity via the
+	// pending-count rule in AdmitMessage (acknowledged messages no longer
+	// count), without redefining presentation as handling.
+	settle := receipt.Status.Terminal()
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		// Stale-transition check: a terminal inbox state must not be
+		// moved backwards by a late receipt.
+		var curState string
+		if err := tx.QueryRowContext(ctx, `SELECT inbox_state FROM messages WHERE message_id = ?`, receipt.MessageID).Scan(&curState); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("store: outcome lookup: %w", err)
+		}
+		// Legal transition matrix (monotonic forward only, duplicates
+		// idempotent, regressions rejected):
+		//   pending/accepted/claimed -> any terminal target (forward)
+		//   acknowledged -> delivered (forward), acknowledged -> acknowledged (idempotent)
+		//   delivered -> delivered (idempotent); delivered -> acknowledged is a
+		//     regression and is rejected.
+		//   rejected/voided/dead_letter -> self (idempotent only); any
+		//     success target is rejected, and switching between terminal
+		//     failure states is rejected.
+		//   unknown receipts (target "") never change state.
+		cur := InboxState(curState)
+		rank := func(s InboxState) int {
+			switch s {
+			case InboxPending:
+				return 0
+			case InboxAccepted:
+				return 1
+			case InboxClaimed:
+				return 2
+			case InboxAcknowledged:
+				return 3
+			case InboxDelivered:
+				return 4
+			default:
+				return -1
+			}
+		}
+		isTerminalFailure := func(s InboxState) bool {
+			return s == InboxRejected || s == InboxVoided || s == InboxDeadLetter
+		}
+		if target != "" {
+			if isTerminalFailure(cur) {
+				if target != cur {
+					return ErrConflict
+				}
+			} else if isTerminalFailure(target) {
+				// acknowledged/delivered are success-terminal: a failure
+				// receipt arriving later is a regression/rewrite, reject it.
+				if cur == InboxAcknowledged || cur == InboxDelivered {
+					return ErrConflict
+				}
+			} else {
+				// Both non-failure: enforce rank monotonicity.
+				rCur, rTarget := rank(cur), rank(target)
+				if rCur > rTarget {
+					return ErrConflict
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO receipts (message_id, command_id, status, from_session, to_session, detail, observed_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			receipt.MessageID, receipt.CommandID, receipt.Status, receipt.From, receipt.To, receipt.Detail,
+			receipt.ObservedAt.UTC().Format(TimestampLayout)); err != nil {
+			return fmt.Errorf("store: insert receipt outcome: %w", err)
+		}
+		if target != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET inbox_state = ? WHERE message_id = ?`, target, receipt.MessageID); err != nil {
+				return fmt.Errorf("store: outcome inbox transition: %w", err)
+			}
+		}
+		if settle && receipt.CommandID != "" {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE commands SET state = ?, disposition = ?, updated_at = ? WHERE command_id = ?`,
+				protocol.CommandSettled, string(receipt.Status), time.Now().UTC().Format(TimestampLayout), receipt.CommandID); err != nil {
+				return fmt.Errorf("store: settle command outcome: %w", err)
+			}
+		}
+		if event.EventID != "" {
+			if _, err := s.AppendEventTx(ctx, tx, event, receipt.CommandID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // CountPendingInbox counts undelivered messages for a recipient.
 func (s *Store) CountPendingInbox(ctx context.Context, sessionID string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE to_session = ? AND inbox_state IN (?, ?)`,
-		sessionID, InboxPending, InboxAccepted).Scan(&n)
+		`SELECT COUNT(*) FROM messages WHERE to_session = ? AND inbox_state IN (?, ?, ?)`,
+		sessionID, InboxPending, InboxAccepted, InboxClaimed).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("store: count pending inbox: %w", err)
 	}
@@ -315,9 +654,13 @@ func (s *Store) PurgeMessagesOlderThan(ctx context.Context, cutoff time.Time) (i
 	mark := cutoff.UTC().Format(TimestampLayout)
 	var removed int64
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		// Purge only terminal messages. Pending/claimed messages (incl. active
+		// leases) and dedup obligations inside the horizon are preserved:
+		// the caller guarantees cutoff is at/older than the horizon.
+		terminal := "inbox_state IN ('delivered','acknowledged','rejected','voided','dead_letter')"
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM receipts WHERE message_id IN (
-				SELECT message_id FROM messages WHERE created_at < ? AND expires_at = ''
+				SELECT message_id FROM messages WHERE created_at < ? AND `+terminal+`
 			)`, mark)
 		if err != nil {
 			return fmt.Errorf("store: purge receipts: %w", err)
@@ -325,11 +668,19 @@ func (s *Store) PurgeMessagesOlderThan(ctx context.Context, cutoff time.Time) (i
 		_ = res
 
 		res, err = tx.ExecContext(ctx,
-			`DELETE FROM messages WHERE created_at < ? AND expires_at = ''`, mark)
+			`DELETE FROM messages WHERE created_at < ? AND `+terminal, mark)
 		if err != nil {
 			return fmt.Errorf("store: purge messages: %w", err)
 		}
 		removed, _ = res.RowsAffected()
+		// Purge settled commands whose messages are gone and which are older
+		// than the cutoff, bounding the ledger without breaking dedup inside
+		// the horizon (cutoff already respects it).
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM commands WHERE created_at < ? AND state NOT IN ('accepted','executing')
+			 AND command_id NOT IN (SELECT command_id FROM messages)`, mark); err != nil {
+			return fmt.Errorf("store: purge commands: %w", err)
+		}
 		return nil
 	})
 	return removed, err
@@ -342,9 +693,9 @@ func (s *Store) ExpiredMessages(ctx context.Context, now time.Time, limit int) (
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT message_id FROM messages
-		 WHERE expires_at != '' AND expires_at < ? AND inbox_state IN (?, ?)
+		 WHERE expires_at != '' AND expires_at < ? AND inbox_state IN (?, ?, ?)
 		 ORDER BY expires_at ASC LIMIT ?`,
-		now.UTC().Format(TimestampLayout), InboxPending, InboxAccepted, limit)
+		now.UTC().Format(TimestampLayout), InboxPending, InboxAccepted, InboxClaimed, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: query expired: %w", err)
 	}

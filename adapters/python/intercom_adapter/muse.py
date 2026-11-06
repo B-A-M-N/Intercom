@@ -10,9 +10,19 @@ The MSP contract used here was taken from the schema that `muse schema
 generate-json-schema` exports, which is the binary's own authority on its
 wire format:
 
-    turn/start   TurnStartParams  {commandId, sessionId, input[], ifBusy}
-    turn/steer   TurnSteerParams  {commandId, sessionId, expectedTurnId, input[]}
-    turn/unqueue TurnUnqueueParams {commandId, sessionId, turnId}
+    initialize     ClientInfo   {protocolVersion, clientInfo}
+    session/start  SessionStartParams {commandId (UUIDv7), workspaceRoot,
+                   config.mcpServers?}
+    turn/start     TurnStartParams  {commandId, sessionId, input[], ifBusy}
+    turn/steer     TurnSteerParams  {commandId, sessionId, expectedTurnId, input[]}
+    turn/unqueue   TurnUnqueueParams {commandId, sessionId, turnId}
+
+Intercom session identities (`ses_<uuidv7>`) and Muse session identities
+(Muse-minted UUIDs) live in different namespaces. The adapter therefore
+maps one to the other: `session_starter` creates (or resumes) an MSP
+session for an Intercom session on first use and caches the mapping.
+Without a starter the Intercom id is used as the MSP id, which is what
+the unit tests with a fake client exercise.
 
 Intercom does not claim wire-level MSP compatibility. This adapter speaks
 MSP to Muse and Intercom to the Go core; a separate bridge would be needed
@@ -22,7 +32,7 @@ for MSP conformance claims (ICSP-001 section 17).
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .harness import (
     MODE_NOTIFY,
@@ -39,6 +49,7 @@ from .harness import (
     SessionState,
     UnsupportedOperation,
 )
+from .ids import harness_command_id
 
 # MSP IfBusy dispositions.
 IF_BUSY_QUEUE = "queue"
@@ -55,23 +66,89 @@ class MuseAdapter(BaseHarness):
     """
 
     name = "muse"
-    version = "0.1.0"
+    version = "0.2.0"
 
     #: Muse natively supports all three delivery modes. Steering maps onto
     #: MSP `turn/steer`, queueing onto `turn/start` with ifBusy=queue, and
     #: notification onto the session inbox.
     modes = (MODE_STEER, MODE_QUEUE, MODE_NOTIFY)
+    live_verified_modes = (MODE_STEER,)
 
-    def __init__(self, msp_client: Any, session_id: str = "") -> None:
+    def __init__(
+        self,
+        msp_client: Any,
+        session_id: str = "",
+        session_starter: Optional[Callable[[str], str]] = None,
+    ) -> None:
         super().__init__()
         self._msp = msp_client
         self._session_id = session_id
+        self._session_starter = session_starter
+        # Intercom session id -> MSP session id, learned by starting the
+        # MSP session on first use. The two id namespaces are unrelated.
+        self._msp_sessions: dict[str, str] = {}
         # The active turn per session, learned from turn notifications and
         # from turn/start and turn/steer results.
         self._turns: dict[str, str] = {}
         self._states: dict[str, str] = {}
+        # Reverse map for MSP notifications, which carry the MSP session id.
+        self._intercom_by_msp: dict[str, str] = {}
         # Operator-visible notifications, keyed by session.
         self._notes: dict[str, list[str]] = {}
+        # Learn turns and states from MSP notifications when the client
+        # can report them (the real MSPClient can; test fakes may not).
+        on_notification = getattr(msp_client, "on_notification", None)
+        if callable(on_notification):
+            on_notification(self._handle_msp_notification)
+
+    # -- session identity mapping -------------------------------------------
+
+    def msp_session(self, session_id: str) -> str:
+        """Return the MSP session id for an Intercom session id.
+
+        Starts the MSP session on first use when a starter is configured.
+        A starter failure raises UnsupportedOperation, so delivery is
+        reported as rejected rather than sent to a session that does not
+        exist.
+        """
+        mapped = self._msp_sessions.get(session_id) or self._lookup_mapping(session_id)
+        if mapped:
+            self._msp_sessions[session_id] = mapped
+            self._intercom_by_msp[mapped] = session_id
+            return mapped
+        starter = self._session_starter
+        if starter is None:
+            return session_id
+        try:
+            msp_session_id = starter(session_id)
+        except Exception as exc:
+            raise UnsupportedOperation(f"muse session/start failed: {exc}") from exc
+        if not msp_session_id:
+            raise UnsupportedOperation("muse session/start returned no session id")
+        self._msp_sessions[session_id] = msp_session_id
+        self._intercom_by_msp[msp_session_id] = session_id
+        self._persist_mapping(session_id, msp_session_id)
+        return msp_session_id
+
+    def _handle_msp_notification(self, method: str, params: Any) -> None:
+        """Fold MSP turn/session notifications into adapter state."""
+        if not isinstance(params, dict):
+            return
+        msp_session_id = str(params.get("sessionId") or "")
+        session_id = self._intercom_by_msp.get(msp_session_id, msp_session_id)
+        if method == "turn/started":
+            turn_id = str(params.get("turnId") or "")
+            if turn_id:
+                self.note_turn(session_id, turn_id)
+            self.note_state(session_id, "running")
+        elif method == "turn/completed":
+            # The named turn is over; it must not be steered into again.
+            self._turns.pop(session_id, None)
+            self.note_state(session_id, "idle")
+        elif method == "session/statusChanged":
+            status = str(params.get("status") or "")
+            if status in ("running", "idle"):
+                self.note_state(session_id, status)
 
     # -- MSP plumbing -----------------------------------------------------
 
@@ -86,6 +163,20 @@ class MuseAdapter(BaseHarness):
     def bind_session(self, session_id: str) -> None:
         """Bind the adapter to the session it represents."""
         self._session_id = session_id
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the underlying MSP client, if it needs starting."""
+        start = getattr(self._msp, "start", None)
+        if callable(start):
+            start()
+
+    def close(self) -> None:
+        """Close the underlying MSP client, if it can be closed."""
+        close = getattr(self._msp, "close", None)
+        if callable(close):
+            close()
 
     def note_turn(self, session_id: str, turn_id: str) -> None:
         """Record the active turn for a session.
@@ -135,7 +226,14 @@ class MuseAdapter(BaseHarness):
         """
         text = _message_text(message)
         mode = (message.get("delivery") or {}).get("mode", MODE_QUEUE)
-        command_id = message.get("commandId") or message.get("command_id") or ""
+        raw_command_id = message.get("commandId") or message.get("command_id") or ""
+        # MSP requires a UUIDv7 commandId; an Intercom `cmd_`-prefixed id
+        # is translated, preserving idempotency (see ids.harness_command_id).
+        command_id = harness_command_id(raw_command_id)
+        try:
+            msp_session_id = self.msp_session(session_id)
+        except UnsupportedOperation as exc:
+            return DeliveryResult(status=RECEIPT_REJECTED, detail=str(exc))
 
         if mode == MODE_STEER:
             turn_id = self._turns.get(session_id, "")
@@ -152,7 +250,7 @@ class MuseAdapter(BaseHarness):
                     "turn/steer",
                     {
                         "commandId": command_id,
-                        "sessionId": session_id,
+                        "sessionId": msp_session_id,
                         "expectedTurnId": turn_id,
                         "input": [{"type": "text", "text": text}],
                     },
@@ -172,7 +270,7 @@ class MuseAdapter(BaseHarness):
                 "turn/start",
                 {
                     "commandId": command_id,
-                    "sessionId": session_id,
+                    "sessionId": msp_session_id,
                     "input": [{"type": "text", "text": text}],
                     "ifBusy": IF_BUSY_QUEUE,
                 },
@@ -208,7 +306,11 @@ class MuseAdapter(BaseHarness):
         reported as "injected", because nothing was injected.
         """
         text = _message_text(message)
-        self._notes.setdefault(session_id, []).append(text)
+        if not self._notify_durable(session_id, text, message):
+            return DeliveryResult(
+                status=RECEIPT_UNKNOWN,
+                detail="notification could not be durably persisted; not presented",
+            )
         return DeliveryResult(
             status=RECEIPT_PRESENTED,
             detail=(
@@ -223,15 +325,10 @@ class MuseAdapter(BaseHarness):
 
 
 def _message_text(message: dict[str, Any]) -> str:
-    """Extract the text body from an Intercom message."""
-    body = message.get("body") or {}
-    if isinstance(body, dict):
-        text = body.get("text", "")
-        if text:
-            return str(text)
-        # A structured body is rendered compactly rather than dropped.
-        return json.dumps(body, separators=(",", ":"), sort_keys=True)
-    return str(body)
+    """Extract labeled peer text (provenance enforced)."""
+    from .harness import render_peer_text
+
+    return render_peer_text(message)
 
 
 __all__ = ["MuseAdapter", "NotReady"]

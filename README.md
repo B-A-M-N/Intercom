@@ -17,8 +17,8 @@ describes what is built.
 | `IC-LOCAL` | Implemented | Local authenticated peer communication and delivery receipts |
 | `IC-DURABLE` | Implemented | Command deduplication, durable admission, event replay, crash recovery |
 | `IC-ACP` | Implemented | ACP v1 extension compatibility and capability negotiation |
-| `IC-REMOTE` | Not implemented | Cross-host transport is a future profile; remote messaging is opt-in and not enabled |
-| `IC-STEER` | Implemented for Muse | Verified live-turn injection through MSP `turn/steer` |
+| `IC-REMOTE` | Implemented (opt-in) | mTLS federation with pinned host fingerprints and mutual enrollment; remote messaging is opt-in (`--remote-listen`) and never plaintext |
+| `IC-STEER` | Implemented for Muse and Codex | Verified live-turn injection through MSP `turn/steer` and Codex app-server `turn/steer` (see docs/HARNESSES.md) |
 
 An implementation cannot claim compliance merely by exchanging JSON
 messages. The conformance suite in `conformance/` is the evidence, and it is
@@ -112,7 +112,7 @@ internal/transport   Unix sockets with SO_PEERCRED; JSON-RPC 2.0 framing
 internal/adapter     The adapter contract and its honesty rules
 internal/adapter/acp The _intercom/* extension surface
 
-adapters/python      The adapter host and the Muse and Hermes adapters
+adapters/python      The adapter host and the Muse, Codex, OpenCode, Hermes, Claude, and MCP adapters
 conformance          The section 14 protocol tests and section 16 acceptance
 docs/spec            The ICSP-001 specification text
 ```
@@ -161,8 +161,11 @@ and no special authority.
 
 ### ACP over stdio
 
-An adapter host talks ACP to the extension over stdio, which keeps the
-host's Unix socket private to the local host process:
+An adapter host talks ACP to the extension over stdio. `intercom-acp` is a
+thin forwarder: it connects to `intercomd` over the daemon socket, registers
+its session on that connection (binding the connection to the session), and
+forwards every stdio request to the daemon. It never opens the durable
+store; only `intercomd` owns durable state:
 
 ```sh
 go run ./cmd/intercom-acp --socket /tmp/intercom/intercom.sock --session ses_x --harness muse
@@ -193,9 +196,12 @@ transport.
 
 ## Known gaps
 
-- **No cross-host transport.** `IC-REMOTE` is not claimed. The
-  specification puts it in a later phase and requires it to be opt-in.
-- **Steering is verified only for Muse.** Other harnesses report steer as
+- **Cross-host transport is opt-in and loopback-qualified.**
+  `IC-REMOTE` federation runs only with `--remote-listen`, uses mTLS
+  with pinned host fingerprints and mutual enrollment, and refuses
+  plaintext. Live cross-host exchange with real harnesses is not yet
+  qualified (the two-host protocol exchange is tested in-process).
+- **Steering is verified for Muse and Codex.** Other harnesses report steer as
   unsupported until someone verifies their native surface.
 - **No tool-level approval surface.** `approval.owner_control` is
   advertised, and the authority separation is enforced and tested, but the

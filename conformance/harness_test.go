@@ -8,14 +8,15 @@ package conformance
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/adapter"
-	"github.com/bamn/intercom/internal/config"
-	"github.com/bamn/intercom/internal/node"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/adapter"
+	"github.com/B-A-M-N/intercom/internal/config"
+	"github.com/B-A-M-N/intercom/internal/node"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // fakeAdapter is a synthetic agent harness used for deterministic protocol
@@ -24,6 +25,7 @@ import (
 // It records what it was asked to do so that tests can assert on delivery
 // behaviour without running a real agent.
 type fakeAdapter struct {
+	mu        sync.Mutex
 	harness   string
 	version   string
 	modes     []protocol.DeliveryMode
@@ -33,6 +35,29 @@ type fakeAdapter struct {
 	notified  []protocol.Message
 	steerable bool
 	woken     []protocol.Message
+}
+
+func (f *fakeAdapter) notifiedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.notified)
+}
+func (f *fakeAdapter) notifiedMsg(i int) protocol.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notified[i]
+}
+func (f *fakeAdapter) deliveredCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.delivered) }
+func (f *fakeAdapter) deliveredMsg(i int) protocol.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.delivered[i]
+}
+func (f *fakeAdapter) wokenCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.woken) }
+func (f *fakeAdapter) wokenMsg(i int) protocol.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.woken[i]
 }
 
 func newFakeAdapter(modes ...protocol.DeliveryMode) *fakeAdapter {
@@ -59,7 +84,9 @@ func (f *fakeAdapter) State(ctx context.Context, sessionID string) (adapter.Sess
 }
 
 func (f *fakeAdapter) Deliver(ctx context.Context, sessionID string, msg protocol.Message) (adapter.DeliveryResult, error) {
+	f.mu.Lock()
 	f.delivered = append(f.delivered, msg)
+	f.mu.Unlock()
 	return adapter.DeliveryResult{
 		Status: protocol.ReceiptDelivered,
 		Detail: "queued for the next eligible turn",
@@ -67,7 +94,9 @@ func (f *fakeAdapter) Deliver(ctx context.Context, sessionID string, msg protoco
 }
 
 func (f *fakeAdapter) Notify(ctx context.Context, sessionID string, msg protocol.Message) (adapter.DeliveryResult, error) {
+	f.mu.Lock()
 	f.notified = append(f.notified, msg)
+	f.mu.Unlock()
 	return adapter.DeliveryResult{
 		Status: protocol.ReceiptPresented,
 		Detail: "presented by the notification handler",
@@ -75,7 +104,9 @@ func (f *fakeAdapter) Notify(ctx context.Context, sessionID string, msg protocol
 }
 
 func (f *fakeAdapter) Wake(ctx context.Context, sessionID string, msg protocol.Message) (adapter.DeliveryResult, error) {
+	f.mu.Lock()
 	f.woken = append(f.woken, msg)
+	f.mu.Unlock()
 	return adapter.DeliveryResult{
 		Status: protocol.ReceiptHandled,
 		Detail: "recipient woken to act on the message",
@@ -95,7 +126,9 @@ func newSteerAdapter() *steerAdapter {
 }
 
 func (s *steerAdapter) Deliver(ctx context.Context, sessionID string, msg protocol.Message) (adapter.DeliveryResult, error) {
+	s.mu.Lock()
 	s.delivered = append(s.delivered, msg)
+	s.mu.Unlock()
 	if !s.steerable {
 		return adapter.DeliveryResult{}, adapter.ErrUnsupported
 	}
@@ -124,7 +157,7 @@ func newEnv(t *testing.T) *env {
 
 	cfg := config.Default()
 	cfg.DataDir = t.TempDir()
-	cfg.SocketPath = t.TempDir() + "/intercom.sock"
+	cfg.SocketPath = shortSocketDir(t) + "/intercom.sock"
 	cfg.Alias = "test-host"
 	cfg.PrincipalID = "prn_test000000000000000000000000000"
 	cfg.Limits.PerPeerRatePerMinute = 10000

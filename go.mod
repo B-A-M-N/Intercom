@@ -1,4 +1,4 @@
-module github.com/bamn/intercom
+module github.com/B-A-M-N/intercom
 
 go 1.25.0
 

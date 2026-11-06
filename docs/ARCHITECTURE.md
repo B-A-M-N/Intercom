@@ -186,8 +186,9 @@ Peers are authenticated by `SO_PEERCRED`. The socket file is created with
 owner-only permissions.
 
 The ACP extension runs over the same JSON-RPC framing, either on the socket
-or over stdio. Over stdio it keeps the host's socket private to the local
-host process, which is the arrangement an adapter host uses.
+or over stdio. Over stdio, `intercom-acp` forwards to the daemon socket on
+one bound connection; it does not open the store. Only `intercomd` owns
+durable state, which is the arrangement an adapter host uses.
 
 ## ACP interoperability
 
@@ -232,5 +233,7 @@ explicit rather than unbounded:
 - **No merged filesystem permissions.** Section 11.4 is explicit that
   separate sessions imply no isolation, and Intercom makes no such claim.
 - **No distributed consensus.** The local profile needs none.
-- **No cross-host transport yet.** `IC-REMOTE` is a later profile and must
-  be opt-in.
+- **Cross-host transport is opt-in.** `IC-REMOTE` federation requires
+  `--remote-listen`, mTLS with pinned host fingerprints, and mutual
+  enrollment; there is no plaintext path. It is qualified by the
+  two-host protocol tests, not yet by live cross-host harness runs.

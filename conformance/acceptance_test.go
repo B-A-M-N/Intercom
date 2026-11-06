@@ -11,9 +11,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/transport"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/transport"
 )
+
+// shortSocketDir returns a directory short enough for a unix socket
+// path (108-byte limit). t.TempDir() embeds the (often long) test
+// name, which can push the socket path past the limit on hosts with
+// long temp roots; a short random directory under the same root does
+// not. The directory is removed with the test.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(os.TempDir(), "ic-")
+	if err != nil {
+		t.Fatalf("create short socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 // acceptanceEnv is a running Intercom host with a built CLI.
 type acceptanceEnv struct {
@@ -56,7 +71,7 @@ func startAcceptanceHost(t *testing.T) *acceptanceEnv {
 		}
 	}
 
-	socketPath := filepath.Join(t.TempDir(), "intercom.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "intercom.sock")
 	dataDir := filepath.Join(t.TempDir(), "data")
 
 	host := exec.Command(hostBin,
@@ -130,9 +145,38 @@ func (e *acceptanceEnv) registerSession(sessionID, alias, harness string) {
 			{"id": "delivery.queue", "support": "native"},
 		},
 		"deliveryModes": []string{"notify", "queue"},
+		"sessionSecret": testSessionSecret(sessionID),
 	})
 	if resp.Error != nil {
 		e.t.Fatalf("register session: %v", resp.Error)
+	}
+}
+
+// testSessionSecret is the client-held resume secret used by conformance
+// helpers: the same deterministic secret is supplied on first registration
+// and on every resume, modelling a client that persists its secret.
+func testSessionSecret(sessionID string) string {
+	return "test-secret-" + sessionID
+}
+
+// bindSession binds an existing connection to a logical session by
+// registering (resuming) that session on the same connection. Inbox and
+// receipt operations require this owner binding; a bare sessionId in a
+// request is not authentication evidence.
+func bindSession(t *testing.T, client *rpcClient, sessionID, alias, harness string) {
+	t.Helper()
+	resp := client.call(t, protocol.MethodSessionRegister, map[string]any{
+		"sessionId":      sessionID,
+		"instanceId":     "ins_bind" + harness + sessionID[len(sessionID)-4:],
+		"alias":          alias,
+		"harness":        harness,
+		"harnessVersion": "1.0.0",
+		"capabilities":   []map[string]any{{"id": "delivery.notify", "support": "native"}, {"id": "delivery.queue", "support": "native"}},
+		"deliveryModes":  []string{"notify", "queue"},
+		"sessionSecret":  testSessionSecret(sessionID),
+	})
+	if resp.Error != nil {
+		t.Fatalf("bind session %s: %v", sessionID, resp.Error)
 	}
 }
 
@@ -205,6 +249,7 @@ func Test_Acceptance02_ExchangeWithoutOrchestrator(t *testing.T) {
 
 	// The recipient claims its inbox and finds the message.
 	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
 	inboxResp := recipient.call(t, protocol.MethodMessageListPending, map[string]any{
 		"sessionId": "ses_hermes0000000000000000000000",
 	})
@@ -224,11 +269,13 @@ func Test_Acceptance02_ExchangeWithoutOrchestrator(t *testing.T) {
 		t.Errorf("message text = %q", inbox.Messages[0].Body.Text)
 	}
 
-	// The recipient reports what it did.
+	// The recipient reports what it did, presenting its claim token.
 	reportResp := recipient.call(t, protocol.MethodMessageReport, map[string]any{
-		"messageId": sent.MessageID,
-		"status":    "presented",
-		"detail":    "presented by the notification handler",
+		"messageId":       sent.MessageID,
+		"status":          "presented",
+		"detail":          "presented by the notification handler",
+		"claimToken":      inbox.Messages[0].ClaimToken,
+		"claimGeneration": inbox.Messages[0].ClaimGeneration,
 	})
 	if reportResp.Error != nil {
 		t.Fatalf("message/report failed: %v", reportResp.Error)
@@ -270,6 +317,7 @@ func Test_Acceptance03_IdentitiesPreserved(t *testing.T) {
 	}
 
 	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
 	inboxResp := recipient.call(t, protocol.MethodMessageListPending, map[string]any{
 		"sessionId": "ses_hermes0000000000000000000000",
 	})
@@ -345,6 +393,7 @@ func Test_Acceptance06_RetryAfterConnectionLoss(t *testing.T) {
 
 	// The recipient must see exactly one inbox entry.
 	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
 	inboxResp := recipient.call(t, protocol.MethodMessageListPending, map[string]any{
 		"sessionId": "ses_hermes0000000000000000000000",
 	})
@@ -417,6 +466,7 @@ func Test_Acceptance07_RestartPreservesState(t *testing.T) {
 
 	// The message is still in the durable inbox.
 	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
 	inboxResp := recipient.call(t, protocol.MethodMessageListPending, map[string]any{
 		"sessionId": "ses_hermes0000000000000000000000",
 	})
@@ -477,8 +527,12 @@ func Test_Acceptance09_UnauthorizedCannotModifyPermissions(t *testing.T) {
 		t.Errorf("error code = %d, want %d (forbidden)", resp.Error.Code, protocol.CodeForbidden)
 	}
 
-	// The grant was not recorded.
-	listResp := client.call(t, protocol.MethodPermissionList, map[string]any{
+	// The grant was not recorded. The attacker lists its own (empty) grants
+	// after binding to its session; an unbound caller listing another
+	// session's grants is forbidden.
+	attacker := dialRPC(t, env.socketPath)
+	bindSession(t, attacker, "ses_attacker000000000000000000000", "attacker", "hermes")
+	listResp := attacker.call(t, protocol.MethodPermissionList, map[string]any{
 		"peerSession": "ses_attacker000000000000000000000",
 	})
 	if listResp.Error != nil {
@@ -540,7 +594,9 @@ func Test_Acceptance04_QueuedOrNotified(t *testing.T) {
 
 	// Both messages reached the recipient's durable inbox, in submission
 	// order.
-	inboxResp := client.call(t, protocol.MethodMessageListPending, map[string]any{
+	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
+	inboxResp := recipient.call(t, protocol.MethodMessageListPending, map[string]any{
 		"sessionId": "ses_hermes0000000000000000000000",
 	})
 	if inboxResp.Error != nil {
@@ -625,7 +681,9 @@ func Test_Acceptance05_OutcomesDistinguishable(t *testing.T) {
 
 	// The recipient reports that it presented the message, which is
 	// distinct from the acknowledgment.
-	reportResp := client.call(t, protocol.MethodMessageReport, map[string]any{
+	recipient := dialRPC(t, env.socketPath)
+	bindSession(t, recipient, "ses_hermes0000000000000000000000", "hermes-agent", "hermes")
+	reportResp := recipient.call(t, protocol.MethodMessageReport, map[string]any{
 		"messageId": sent.MessageID,
 		"status":    "presented",
 		"detail":    "presented by the notification handler",
@@ -650,7 +708,7 @@ func Test_Acceptance05_OutcomesDistinguishable(t *testing.T) {
 
 	// "handled" is a separate state from "presented", and neither means
 	// the task was completed correctly.
-	client.call(t, protocol.MethodMessageReport, map[string]any{
+	recipient.call(t, protocol.MethodMessageReport, map[string]any{
 		"messageId": sent.MessageID,
 		"status":    "handled",
 		"detail":    "the recipient acknowledged the message",

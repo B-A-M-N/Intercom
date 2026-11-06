@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
     last_seen     TEXT NOT NULL DEFAULT '',
+    trust_domain  TEXT NOT NULL DEFAULT 'local',
+    tags          TEXT NOT NULL DEFAULT '[]',
     FOREIGN KEY (host_id) REFERENCES hosts(host_id)
 );
 
@@ -90,6 +92,10 @@ CREATE TABLE IF NOT EXISTS messages (
     expires_at    TEXT NOT NULL DEFAULT '',
     metadata      TEXT NOT NULL DEFAULT '{}',
     inbox_state   TEXT NOT NULL DEFAULT 'pending',
+    conversation_id TEXT NOT NULL DEFAULT '',
+    claim_owner   TEXT NOT NULL DEFAULT '',
+    claim_expires TEXT NOT NULL DEFAULT '',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (command_id) REFERENCES commands(command_id)
 );
 
@@ -135,6 +141,31 @@ CREATE TABLE IF NOT EXISTS session_compaction (
     compacted_at  TEXT NOT NULL
 );
 
+-- Monotonic per-session event sequence high-water mark. This survives
+-- full journal compaction, unlike MAX(sequence) over retained rows.
+CREATE TABLE IF NOT EXISTS session_event_sequences (
+    session_id    TEXT PRIMARY KEY,
+    high_water    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-session resume credentials. Only the hash is stored; the plaintext
+-- secret is held by the owning client and required to resume a session
+-- that already exists. A shared UID is not proof of ownership.
+CREATE TABLE IF NOT EXISTS session_secrets (
+    session_id    TEXT PRIMARY KEY,
+    secret_hash   TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+-- Claim fencing for inbox delivery: token + generation ensure only the
+-- current lease holder can acknowledge a claimed message.
+CREATE TABLE IF NOT EXISTS message_claims (
+    message_id        TEXT PRIMARY KEY,
+    claim_token       TEXT NOT NULL DEFAULT '',
+    claim_generation  INTEGER NOT NULL DEFAULT 0
+);
+
 -- Per-peer authorization (ICSP-001 section 11).
 --
 -- A peer must never gain owner authority through messaging; the role column
@@ -145,6 +176,7 @@ CREATE TABLE IF NOT EXISTS peer_permissions (
     role          TEXT NOT NULL,
     granted_at    TEXT NOT NULL,
     revoked_at    TEXT NOT NULL DEFAULT '',
+    expires_at    TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (peer_session, owner_session)
 );
 
@@ -172,3 +204,56 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_principal ON audit_log(principal_id);
+
+-- Conversations (Phase 4 minimum model): one-to-one first, explicit
+-- membership, no public broadcast bus.
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_participants (
+    conversation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, session_id)
+);
+
+-- Remote federation (Phase 6, IC-REMOTE): each host keeps its own store.
+CREATE TABLE IF NOT EXISTS remote_hosts (
+    host_id TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    trust_status TEXT NOT NULL DEFAULT 'trusted',
+    credential_hash TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_transfers (
+    message_id TEXT PRIMARY KEY,
+    remote_host TEXT NOT NULL,
+    target_session TEXT NOT NULL,
+    sender_session TEXT NOT NULL DEFAULT '',
+    envelope TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    next_retry_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Scoped delegation tokens for attached clients (embedded MCP). A token is
+-- issued by the session owner, is short-lived, and only binds a connection
+-- as an attached client of the session; it cannot replace the owner's
+-- instance identity, capabilities, or resume secret. Only a hash is stored.
+CREATE TABLE IF NOT EXISTS session_delegations (
+    token_hash TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'mcp',
+    owner_instance TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_delegations_session ON session_delegations(session_id);

@@ -5,3 +5,6 @@
 *.db-shm
 /coverage.out
 /.testbin/
+
+__pycache__/
+*.pyc

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bamn/intercom/internal/ids"
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/store"
+	"github.com/B-A-M-N/intercom/internal/ids"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/store"
 )
 
 // SessionState returns the normalized state and recovery classification for a
@@ -145,12 +145,67 @@ func (n *Node) SetSessionState(ctx context.Context, sessionID string, state prot
 	return err
 }
 
+// reconcileUnsettled classifies one unsettled command against its message
+// and receipt trail. Returns nil after settling, preserving, or abandoning.
+func (n *Node) reconcileUnsettled(ctx context.Context, cmd store.CommandRecord, msgID string) error {
+	if _, err := n.store.GetMessage(ctx, msgID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return n.store.AbandonCommand(ctx, cmd.CommandID, "linked message missing at recovery; outcome not established")
+		}
+		return err
+	}
+	receipts, err := n.store.ReceiptsFor(ctx, msgID)
+	if err != nil {
+		return err
+	}
+	// Observed harness effects: delivered/presented/injected/handled means
+	// the harness accepted the message; settle the command to that fact.
+	for _, r := range receipts {
+		switch r.Status {
+		case protocol.ReceiptDelivered, protocol.ReceiptPresented, protocol.ReceiptInjected, protocol.ReceiptHandled:
+			return n.store.SettleCommand(ctx, cmd.CommandID, protocol.CommandSettled, string(r.Status))
+		case protocol.ReceiptRejected, protocol.ReceiptExpired:
+			return n.store.SettleCommand(ctx, cmd.CommandID, protocol.CommandSettled, string(r.Status))
+		}
+	}
+	// Safely pending durable work: message still waits in the inbox with no
+	// harness observation. Preserve it (leave command unsettled) so a later
+	// claim can deliver it. The command remains pending for capacity
+	// accounting until delivery resolves it.
+	owner, state, _, err := n.store.ClaimOwner(ctx, msgID)
+	if err != nil {
+		state = store.InboxPending
+	}
+	_ = owner
+	switch state {
+	case store.InboxPending, store.InboxAccepted:
+		// Explicitly pending: preserve.
+		return nil
+	case store.InboxClaimed:
+		// Claimed but never observed: execution is uncertain. Do not replay;
+		// mark abandoned so the operator can decide, while the message
+		// remains claimable for a safe re-claim (inbox lease expiry governs).
+		return n.store.AbandonCommand(ctx, cmd.CommandID, "message claimed at crash; harness effects unknown, not replayed")
+	default:
+		// Terminal inbox states with no receipt evidence (e.g. voided by
+		// expiry): settle to the inbox fact if it is terminal, else abandon.
+		switch state {
+		case store.InboxRejected:
+			return n.store.SettleCommand(ctx, cmd.CommandID, protocol.CommandSettled, string(protocol.ReceiptRejected))
+		case store.InboxVoided, store.InboxDeadLetter:
+			return n.store.SettleCommand(ctx, cmd.CommandID, protocol.CommandSettled, string(protocol.ReceiptExpired))
+		}
+		return n.store.AbandonCommand(ctx, cmd.CommandID, "admitted without settlement; outcome not established")
+	}
+}
+
 // Recover reconstructs command intake state after a restart
 // (ICSP-001 section 6.2).
 //
-// Recovery is deliberately conservative: a command that was admitted but
-// never settled is marked abandoned rather than silently re-executed, because
-// re-execution could duplicate effects.
+// Recovery reconciles message state, command state, and observed harness
+// effects: safely pending durable work is preserved, known outcomes are
+// settled, and only ambiguous execution is marked abandoned. It never
+// automatically replays a potentially effectful harness command.
 func (n *Node) Recover(ctx context.Context) (RecoveryReport, error) {
 	var report RecoveryReport
 
@@ -161,11 +216,23 @@ func (n *Node) Recover(ctx context.Context) (RecoveryReport, error) {
 	report.Unsettled = len(unsettled)
 
 	for _, cmd := range unsettled {
-		reason := "admitted without settlement; outcome not established"
-		if err := n.store.AbandonCommand(ctx, cmd.CommandID, reason); err != nil {
+		// Reconcile message state, command state, and observed harness
+		// effects together. Preserve legitimately pending durable work;
+		// settle commands whose outcome is known; abandon only ambiguous
+		// execution. Never automatically replay a potentially effectful
+		// harness command.
+		msgID := cmd.MessageID
+		if msgID == "" {
+			// Link may be missing on very old rows; treat as uncertain.
+			if err := n.store.AbandonCommand(ctx, cmd.CommandID, "admitted without settlement or linked message; outcome not established"); err != nil {
+				return report, err
+			}
+			report.Abandoned = append(report.Abandoned, cmd.CommandID)
+			continue
+		}
+		if err := n.reconcileUnsettled(ctx, cmd, msgID); err != nil {
 			return report, err
 		}
-		report.Abandoned = append(report.Abandoned, cmd.CommandID)
 	}
 
 	// Mark every session of this host as disconnected. A host disconnect
@@ -201,11 +268,21 @@ func (n *Node) Recover(ctx context.Context) (RecoveryReport, error) {
 // verbatim so that every peer sees exactly what the harness claimed. The
 // core does not upgrade an adapter's claims.
 func (n *Node) RegisterAdapterSession(ctx context.Context, peer protocol.PeerInfo) error {
+	_, err := n.RegisterAdapterSessionWithSecret(ctx, peer)
+	return err
+}
+
+// RegisterAdapterSessionWithSecret registers or resumes an adapter session
+// with an explicit resume secret. It returns the freshly issued secret
+// when (and only when) this call created the session and the caller did
+// not supply a secret; the caller must persist it for future resumes.
+// Resume without the enrolled secret is forbidden, even for the same UID.
+func (n *Node) RegisterAdapterSessionWithSecret(ctx context.Context, peer protocol.PeerInfo) (string, error) {
 	if peer.SessionID == "" {
-		return protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
+		return "", protocol.Errorf(protocol.CodeInvalidParams, "sessionId is required")
 	}
 	if peer.InstanceID == "" {
-		return protocol.Errorf(protocol.CodeInvalidParams, "instanceId is required")
+		return "", protocol.Errorf(protocol.CodeInvalidParams, "instanceId is required")
 	}
 	if peer.PrincipalID == "" {
 		peer.PrincipalID = n.principalID
@@ -216,9 +293,17 @@ func (n *Node) RegisterAdapterSession(ctx context.Context, peer protocol.PeerInf
 	if peer.Presence == "" {
 		peer.Presence = protocol.PresenceOnline
 	}
-
-	if err := n.store.RegisterSession(ctx, peer); err != nil {
-		return err
+	// Authoritative trust domain: assigned by the host, never client-supplied.
+	peer.TrustDomain = "local:" + n.hostID
+	supplied := peer.SessionSecret
+	secret := supplied
+	if secret == "" {
+		secret = store.GenerateSessionSecretForNode()
+		peer.SessionSecret = secret
+	}
+	created, err := n.store.RegisterSessionWithSecret(ctx, peer, secret)
+	if err != nil {
+		return "", err
 	}
 	if _, err := n.store.AppendEvent(ctx, protocol.EventEnvelope{
 		EventID:   mustID("evt"),
@@ -227,9 +312,15 @@ func (n *Node) RegisterAdapterSession(ctx context.Context, peer protocol.PeerInf
 		Timestamp: time.Now().UTC(),
 		Payload:   mustJSON(peer),
 	}, ""); err != nil {
-		return err
+		return "", err
 	}
-	return n.store.Audit(ctx, n.principalID, peer.SessionID, "adapter.registered", peer.Harness)
+	if err := n.store.Audit(ctx, n.principalID, peer.SessionID, "adapter.registered", peer.Harness); err != nil {
+		return "", err
+	}
+	if created && supplied == "" {
+		return secret, nil
+	}
+	return "", nil
 }
 
 // PendingInbox returns the messages waiting for a session to claim.
@@ -271,8 +362,7 @@ func (n *Node) ReportDelivery(ctx context.Context, messageID string, status prot
 		}
 		return err
 	}
-	n.recordReceipt(ctx, msg, status, detail)
-	return nil
+	return n.recordReceipt(ctx, msg, status, detail)
 }
 
 // RecoveryReport summarizes a recovery pass.
@@ -295,6 +385,18 @@ func (r RecoveryReport) String() string {
 
 // Reply sends a correlated reply to the sender of a message.
 func (n *Node) Reply(ctx context.Context, from Sender, messageID, text string, correlationID string) (SendResult, error) {
+	return n.ReplyWithCommandID(ctx, from, messageID, text, correlationID, mustCommandID())
+}
+
+// ReplyWithCommandID sends a correlated reply with a caller-supplied
+// idempotency identity, preserved across retries.
+func (n *Node) ReplyWithCommandID(ctx context.Context, from Sender, messageID, text string, correlationID string, commandID string) (SendResult, error) {
+	if commandID == "" {
+		commandID = mustCommandID()
+	}
+	if err := n.validateSender(ctx, from); err != nil {
+		return SendResult{}, err
+	}
 	orig, err := n.store.GetMessage(ctx, messageID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -302,11 +404,20 @@ func (n *Node) Reply(ctx context.Context, from Sender, messageID, text string, c
 		}
 		return SendResult{}, err
 	}
+	// Only a party to the original message (or a same-principal peer of
+	// the recipient) may reply to it. A stranger must not be able to
+	// inject a correlated reply into someone else's conversation.
+	if from.SessionID != orig.To && from.SessionID != orig.From {
+		recipient, err := n.store.GetSession(ctx, orig.To)
+		if err != nil || recipient.PrincipalID == "" || recipient.PrincipalID != from.PrincipalID {
+			return SendResult{}, protocol.Errorf(protocol.CodeForbidden, "only a party to message %q may reply to it", messageID)
+		}
+	}
 	if correlationID == "" {
 		correlationID = orig.CorrelationID
 	}
 	return n.Send(ctx, from, SendRequest{
-		CommandID:     mustCommandID(),
+		CommandID:     commandID,
 		To:            orig.From,
 		Body:          protocol.MessageBody{Type: "text", Text: text},
 		Delivery:      protocol.Delivery{Mode: protocol.DeliveryQueue, Wake: protocol.WakeNone, OnUnsupported: protocol.UnsupportedReject},
@@ -322,4 +433,45 @@ func mustCommandID() string {
 		return "cmd_unknown"
 	}
 	return id
+}
+
+// IssueDelegationFor mints a scoped attached-client token. The caller must
+// own the session (the connection is already bound to it via a successful
+// session/register with the resume secret).
+func (n *Node) IssueDelegationFor(ctx context.Context, sender Sender, sessionID string) (string, error) {
+	if err := n.validateSender(ctx, sender); err != nil {
+		return "", err
+	}
+	target := sessionID
+	if target == "" {
+		target = sender.SessionID
+	}
+	if err := n.AuthorizeOwn(ctx, sender, target); err != nil {
+		return "", err
+	}
+	ownerInstance := ""
+	if rec, err := n.store.GetSession(ctx, target); err == nil {
+		ownerInstance = rec.InstanceID
+	}
+	return n.store.IssueDelegation(ctx, target, ownerInstance, 24*time.Hour)
+}
+
+// VerifyDelegationFor checks a delegation token without mutating the session.
+func (n *Node) VerifyDelegationFor(ctx context.Context, sessionID, token string) error {
+	return n.store.VerifyDelegation(ctx, sessionID, token)
+}
+
+// VerifyDelegationDetailed checks a delegation token and returns its detail.
+// Attached connections must re-verify on every request so expiry and
+// revocation take effect on already-established connections.
+func (n *Node) VerifyDelegationDetailed(ctx context.Context, sessionID, token string) (store.DelegationInfo, error) {
+	return n.store.VerifyDelegationDetailed(ctx, sessionID, token)
+}
+
+// RevokeDelegationFor revokes a delegation token (owner operation).
+func (n *Node) RevokeDelegationFor(ctx context.Context, sender Sender, token string) error {
+	if err := n.validateSender(ctx, sender); err != nil {
+		return err
+	}
+	return n.store.RevokeDelegation(ctx, token)
 }

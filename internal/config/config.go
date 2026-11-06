@@ -73,6 +73,9 @@ type Config struct {
 	HarnessVersion string `json:"harnessVersion"`
 	// PrincipalID is the authenticated principal this host acts as.
 	PrincipalID string `json:"principalId"`
+	// HostID is the stable host identity. Empty means load-or-create from
+	// the durable store so identity survives daemon restarts.
+	HostID string `json:"hostId,omitempty"`
 	// Limits are the enforced resource bounds.
 	Limits Limits `json:"limits"`
 }
@@ -152,6 +155,12 @@ func (c Config) Validate() error {
 		return errors.New("config: limits.maxConcurrentConnections must be positive")
 	case l.PerPeerRatePerMinute <= 0:
 		return errors.New("config: limits.perPeerRatePerMinute must be positive")
+	case l.MaxPendingCommands < 0:
+		return errors.New("config: limits.maxPendingCommands must not be negative")
+	case l.MaxDatabaseBytes < 0:
+		return errors.New("config: limits.maxDatabaseBytes must not be negative")
+	case l.MessageRetention < 0 || l.EventRetention < 0 || l.DeduplicationHorizon < 0:
+		return errors.New("config: retention windows must not be negative")
 	}
 	return nil
 }

@@ -29,6 +29,14 @@ var ErrNotFound = errors.New("not found")
 // ErrConflict is returned when a commandId is reused with a conflicting request.
 var ErrConflict = errors.New("conflicting command id")
 
+// ErrForbidden is returned when a principal attempts to take over or access
+// a session it does not own. A session registration must not transfer
+// ownership simply by supplying an existing session identifier.
+var ErrForbidden = errors.New("forbidden")
+
+// ErrLimit is returned when a configured resource bound is hit.
+var ErrLimit = errors.New("limit exceeded")
+
 // Store is the durable local store for one Intercom host.
 type Store struct {
 	db *sql.DB
@@ -93,8 +101,112 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
+	if err := migrate(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return &Store{db: db}, nil
+}
+
+// migrate adds columns introduced after the initial schema to stores
+// created by older binaries. SQLite has no ADD COLUMN IF NOT EXISTS, so
+// presence is checked via PRAGMA table_info.
+func migrate(ctx context.Context, db *sql.DB) error {
+	want := map[string]string{
+		"claim_owner":       "TEXT NOT NULL DEFAULT ''",
+		"claim_expires":     "TEXT NOT NULL DEFAULT ''",
+		"delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
+	}
+	for _, add := range []string{
+		`ALTER TABLE remote_hosts ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE remote_transfers ADD COLUMN sender_session TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE remote_transfers ADD COLUMN envelope TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE remote_transfers ADD COLUMN next_retry_at TEXT NOT NULL DEFAULT ''`,
+	} {
+		_, _ = db.ExecContext(ctx, add)
+	}
+	// sessions trust/tags + messages conversation_id
+	for _, add := range []string{
+		`ALTER TABLE sessions ADD COLUMN trust_domain TEXT NOT NULL DEFAULT 'local'`,
+		`ALTER TABLE sessions ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE messages ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		_, _ = db.ExecContext(ctx, add) // duplicate column errors ignored
+	}
+	// peer_permissions expiry (separate table check below)
+	permRows, err := db.QueryContext(ctx, `PRAGMA table_info(peer_permissions)`)
+	if err == nil {
+		havePerm := false
+		for permRows.Next() {
+			var cid int
+			var name, typ string
+			var notnull int
+			var dflt sql.NullString
+			var pk int
+			if err := permRows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil && name == "expires_at" {
+				havePerm = true
+			}
+		}
+		permRows.Close()
+		if !havePerm {
+			if _, err := db.ExecContext(ctx, `ALTER TABLE peer_permissions ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("store: add expires_at: %w", err)
+			}
+		}
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(messages)`)
+	if err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	have := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: migrate scan: %w", err)
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	for col, ddl := range want {
+		if have[col] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE messages ADD COLUMN %s %s`, col, ddl)); err != nil {
+			return fmt.Errorf("store: add column %s: %w", col, err)
+		}
+	}
+	// Backfill monotonic event sequence high-water marks from any
+	// retained journal and compaction floors, so an upgrade cannot
+	// reset numbering after full compaction.
+	_, _ = db.ExecContext(ctx, `INSERT INTO session_event_sequences (session_id, high_water)
+		SELECT session_id, COALESCE(MAX(sequence), 0) FROM session_events GROUP BY session_id
+		ON CONFLICT(session_id) DO UPDATE SET high_water = MAX(high_water, excluded.high_water)`)
+	_, _ = db.ExecContext(ctx, `INSERT INTO session_event_sequences (session_id, high_water)
+		SELECT session_id, compacted_through FROM session_compaction
+		ON CONFLICT(session_id) DO UPDATE SET high_water = MAX(high_water, excluded.high_water)`)
+	return nil
+}
+
+// DBBytes reports the durable store size in bytes via SQLite page counts.
+// It is 0 for in-memory stores where page accounting is not meaningful.
+func (s *Store) DBBytes(ctx context.Context) (int64, error) {
+	var pageCount, pageSize int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return 0, fmt.Errorf("store: page count: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return 0, fmt.Errorf("store: page size: %w", err)
+	}
+	return pageCount * pageSize, nil
 }
 
 // Close releases the database handle.

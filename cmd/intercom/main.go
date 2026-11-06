@@ -17,14 +17,56 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bamn/intercom/internal/protocol"
-	"github.com/bamn/intercom/internal/transport"
+	"github.com/B-A-M-N/intercom/internal/protocol"
+	"github.com/B-A-M-N/intercom/internal/transport"
 )
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "intercom: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func (c *rpc) doctor(ctx context.Context) error {
+	// Bounded structured diagnostics; never logs bodies/credentials.
+	hello, err := c.call(ctx, protocol.MethodHello, nil)
+	if err != nil {
+		return fmt.Errorf("doctor: daemon unreachable: %w", err)
+	}
+	fmt.Printf("daemon: ok (%s)\n", hello)
+	peers, err := c.call(ctx, protocol.MethodPeerList, nil)
+	if err != nil {
+		return fmt.Errorf("doctor: peers unreachable: %w", err)
+	}
+	fmt.Printf("peers: %s\n", peers)
+	return nil
+}
+
+func (c *rpc) remote(ctx context.Context, rest []string) error {
+	if len(rest) < 2 {
+		return errors.New("remote requires a subcommand: list | enroll <hostId> <endpoint> <fingerprint> | send <hostId> <sessionId> <text> | status <messageId>")
+	}
+	switch rest[1] {
+	case "list":
+		return c.callPrint(protocol.MethodRemoteList, nil)
+	case "enroll":
+		if len(rest) < 5 {
+			return errors.New("remote enroll requires <hostId> <endpoint> <fingerprint>")
+		}
+		return c.callPrint(protocol.MethodRemoteEnroll, map[string]any{"hostId": rest[2], "endpoint": rest[3], "fingerprint": rest[4]})
+	case "send":
+		if len(rest) < 5 {
+			return errors.New("remote send requires <hostId> <sessionId> <text>")
+		}
+		return c.callPrint(protocol.MethodRemoteSend, map[string]any{"remoteHost": rest[2], "targetSession": rest[3], "text": rest[4], "commandId": "cmd_cli_" + rest[3]})
+	case "status":
+		if len(rest) < 3 {
+			return errors.New("remote status requires a message id")
+		}
+		return c.callPrint(protocol.MethodRemoteStatus, map[string]any{"messageId": rest[2]})
+	default:
+		return fmt.Errorf("unknown remote subcommand %q", rest[1])
 	}
 }
 
@@ -164,6 +206,23 @@ func run(args []string) error {
 			return errors.New("subscribe requires a session id")
 		}
 		return c.subscribe(ctx, rest[1])
+	case "inbox":
+		return c.callPrint(protocol.MethodMessageListPending, map[string]any{"sessionId": ""})
+	case "route":
+		params := map[string]any{}
+		if len(rest) > 1 {
+			params["target"] = rest[1]
+		}
+		if len(rest) > 2 {
+			params["harness"] = rest[2]
+		}
+		return c.callPrint(protocol.MethodPeerRoute, params)
+	case "grants":
+		return c.callPrint(protocol.MethodPermissionList, map[string]any{})
+	case "remote":
+		return c.remote(ctx, rest)
+	case "doctor":
+		return c.doctor(ctx)
 	default:
 		fmt.Print(usage())
 		return fmt.Errorf("unknown command %q", command)
